@@ -1,0 +1,133 @@
+{
+  "schema": 1,
+  "id": "qwen-image-2.1-turbo-split",
+  "name": "Qwen-Image 2.1 Turbo (3 段 NPU)",
+  "kind": "image",
+  "runtime": "",
+  "version": "1.0.0",
+  "description": "Qwen-Image 2.1 Turbo：7.1B DiT 按层切成 3 段常驻链（0-11 / 11-22 / 22-32），末段就是 sd-server 本身，对外提供 /sdapi 接口。256²/8 步约 55 s，同 prompt 复用约 41 s（v73 / 8 Gen 2）。",
+  "weights": [
+    {
+      "path": "weights/dit.gguf",
+      "role": "main",
+      "bytes": 4199565120
+    },
+    {
+      "path": "weights/te.gguf",
+      "role": "te",
+      "bytes": 5027784800
+    },
+    {
+      "path": "weights/vae.safetensors",
+      "role": "vae",
+      "bytes": 675509688
+    }
+  ],
+  "params": [
+    {
+      "key": "steps",
+      "label": "采样步数",
+      "type": "int",
+      "default": 8,
+      "min": 1,
+      "max": 20,
+      "help": "Turbo 是 8 步蒸馏；这个值会同步给分段链的步号回绕"
+    },
+    {
+      "key": "size",
+      "label": "分辨率",
+      "type": "enum",
+      "default": "256",
+      "options": [
+        "256",
+        "320",
+        "384"
+      ],
+      "help": "512 以上 HTP 的 Flash Attention 数值会漂，暂不放出来"
+    },
+    {
+      "key": "cfg",
+      "label": "CFG",
+      "type": "float",
+      "default": 1.0,
+      "min": 0.0,
+      "max": 5.0,
+      "step": 0.1
+    },
+    {
+      "key": "seed",
+      "label": "随机种子",
+      "type": "int",
+      "default": -1,
+      "help": "-1 表示随机"
+    },
+    {
+      "key": "threads",
+      "label": "CPU 线程",
+      "type": "int",
+      "default": 5,
+      "min": 1,
+      "max": 8,
+      "help": "只影响在 CPU 上的文本编码器；5 线程 + 绑大核实测最快"
+    }
+  ],
+  "entry": {
+    "bin": "sd-server",
+    "args": [
+      "--diffusion-model",
+      "{weight.main}",
+      "--llm",
+      "{weight.te}",
+      "--vae",
+      "{weight.vae}",
+      "--sigmas",
+      "qwen-image-2.1-turbo",
+      "--steps",
+      "{steps}",
+      "--cfg-scale",
+      "{cfg}",
+      "--seed",
+      "{seed}",
+      "-W",
+      "{size}",
+      "-H",
+      "{size}",
+      "-t",
+      "{threads}",
+      "--backend",
+      "diffusion=HTP0,vae=HTP0,te=CPU",
+      "--conv-direct",
+      "auto,vae=on",
+      "--flash-attn",
+      "off,diffusion=on",
+      "--listen-ip",
+      "127.0.0.1"
+    ],
+    "portArg": "--listen-port",
+    "healthPath": "/sdapi/v1/options",
+    "readyTimeoutSec": 420,
+    "stopMode": "sigterm"
+  },
+  "requires": {
+    "ramMb": 12000,
+    "vaMb": 2304,
+    "abi": "arm64-v8a",
+    "minAvailableMb": 4096
+  },
+  "env": {
+    "GGML_HEXAGON_OPQUEUE": "1",
+    "GGML_HEXAGON_MBUF": "128M,128M",
+    "SD_ROPE_NATIVE": "1",
+    "SD_FLASH_ATTN_MAX_KV": "0",
+    "SD_CPU_AFFINITY": "f8",
+    "SD_TE_WARMUP": "2",
+    "SD_DIT_SPLIT_PLAN": "11,22",
+    "SD_DIT_LAYER_FIRST": "22",
+    "SD_DIT_LAYER_LAST": "32",
+    "SD_DIT_SPLIT_STEPS": "{steps}",
+    "SD_DIT_SPLIT_EXIT": "0",
+    "SD_DIT_RELEASE_TE": "0",
+    "SD_DIT_CTX_FILE": "{filesDir}/qisplit-ctx.bin"
+  },
+  "prewarm": true
+}

@@ -1396,3 +1396,115 @@ adb forward tcp:7800 tcp:7800 && curl -s 127.0.0.1:7800/sdapi/v1/options
 
 **注意**：上面第 3 步用符号链接指向 `/data/local/tmp/qisplit/models`，只是本机调试省 9.7 GB；
 正式分发要走进 `dist/*.mlm`（App 内 SAF 导入，解出的是真实文件）。
+
+---
+
+## 26. 一次整机 thrash 的复盘：不是卡死，是旧进程没退干净（2026-11-12）
+
+### 26.1 现象
+
+用户在 App 里发起一个生图任务，随后点了一下「分辨率选择」，整机失去响应，4 分钟后 App 与服务全部消失。
+表面看像「点一下 UI 就把服务搞挂了」。
+
+### 26.2 真实因果链
+
+| 时间 | 事件 |
+|---|---|
+| 06:48 | 第三个请求开始读 4.8 GB 的 TE 权重；日志进度条停在 `270/397`，速度从 1.26 GB/s 单调衰减到 711 MB/s |
+| 06:48:20~25 | 用户点开参数对话框改分辨率，百度输入法连续按键（`input_oppo` 震动事件 × 8） |
+| 06:48:30 | ColorOS 的 `o-kill(4012)` 开始批量清后台：quicksearchbox / sceneservice / camera |
+| 06:48:31 | **输入法自己也被杀**（pid 359），系统连着重启它 3 次 |
+| 06:52:54 | `am_proc_died: [0,18023,dev.pocketmodel.studio]` |
+
+关键证据不是日志，是 **`dumpsys meminfo` 的 DMA-BUF 行**：
+
+```
+Before: DMA-BUF: 13,406,512K   MemAvailable 1.05 GB   SwapFree 3.42 GB
+After : DMA-BUF:  5,395,004K   MemAvailable 13.71 GB  SwapFree 8.23 GB
+```
+
+### 26.3 根因：三个 5 小时 25 分的残留进程
+
+`for d in /proc/[0-9]*; do grep -c dmabuf $d/maps; done` 直接点名：
+
+```
+41 /proc/13230  ./sd-server-hex --diffusion-model models/...
+40 /proc/13209  ./sd-server-hex ...
+27 /proc/13089  ./sd-server-hex ...
+```
+
+`ps -o ELAPSED` = **05:25:10** —— 是 TE 调优那一轮（01:38 左右）用 `serve.sh` 起的链。
+当时只按一个 PID 停，父进程死后两个 worker 没退成，一直占着 13.4 GB dma-buf 活了 5 个多小时。
+
+于是：设备 23.6 GB 总内存、DMA-BUF 吃掉 13.4 GB → 可用只剩 1 GB →
+新服务照样加载 4 GB 权重 → 三方一起 swap thrash（`pswpout` 累计 51 GB、`pgscan_direct` 4.2 TB）
+→ 整片被 o-kill。
+
+**「点分辨率」只是最后一脚**：Compose 对话框 + 新建视图树 + 拉起输入法（~90 MB），
+在可用内存只剩几百 MB 时就是压垮系统的最后一次分配。
+
+### 26.4 ★ 排错教训：grep 名字不全 = 看不见
+
+排查时我执行的是 `ps -A | grep -E 'libsd_server|pocketmodel'` —— **全部为空，于是先怀疑「内存泄漏」**。
+真相是那三个进程的名字叫 `sd-server-hex`（shell 起的），命令行用的是相对路径 `./sd-server-hex`，
+既不含 `libsd_server` 也不含 `qisplit`，两次 grep 都没命中。
+
+**以后核对「服务是否真的停了」，必须按 `dmabuf` 映射数或 cmdline 匹配，不能只 grep 进程名。**
+
+### 26.5 新增 `tools/stop.sh`
+
+```sh
+sh stop.sh            # 默认匹配 sd-server
+```
+
+- 按 cmdline 匹配整条链，用 `/proc/<pid>/environ` 区分 worker 与末段；
+- **先 TERM worker 再 TERM 末段**（反了会让 worker 僵在 socket 等待）；
+- 停完复查残留（仍在就再等 5 s 报出来）；
+- 顺带打印 `MemAvailable` 和 `DMA-BUF`，一眼看出 dma-buf 有没有归还；
+- **绝不 kill -9**（漏 fastrpc PD）。
+
+### 26.6 App 侧两处防呆（不在 sd-split 里，改的是 pocket-model-studio）
+
+**① 分辨率从参数对话框搬到卡片上**
+
+原来 `分辨率` 是 `enum` 参数，得点「参数」图标弹对话框才能选 —— 而对话框会新建视图树、
+点进输入框还会拉起输入法。现在直接渲染成卡片上的一行 FilterChip：
+
+```
+已停止                      [🔧] [📄]
+分辨率  [256] [320] [384]
+```
+
+点一下即改，运行中改动提示「重启服务后生效」，**完全不弹窗**。
+
+**② 启动前内存检查从 C++ 挪到 App**
+
+一开始在 `examples/server/main.cpp` 里加了 `SD_MEM_GUARD_MB`（默认 2048），后来按要求撤回 ——
+这类检查属于「产品决策」，应该由 App 做，运行框架不该内建策略。
+
+实现（`ServiceInstance.doStart` 开头，`new_sd_ctx` 之前）：
+
+```kotlin
+val needMb = manifest.requires.minAvailableMb.takeIf { it > 0 } ?: 1024
+val availMb = readMemAvailableMb()          // /proc/meminfo 的 MemAvailable
+if (availMb > 0 && availMb < needMb) { fail("可用内存不足：${availMb} MB，需要 ${needMb} MB……"); return }
+```
+
+manifest 新增字段 `requires.minAvailableMb`（与 `ramMb` 区分：`ramMb` 是「设备总内存够不够」的宣传口径，
+查了也拦不住 —— 出事时设备仍有 12 GB 总内存；真正要卡的是**空闲不够**）。qwen-image 包声明 **4096**。
+
+### 26.7 实测（v73）
+
+| 项 | 结果 |
+|---|---|
+| 残留进程清理 | TERM worker → TERM 末段，dma-buf 13.4 → 5.39 GB，可用 1.05 → 13.71 GB |
+| 重启服务（256²） | 首个请求 83.7 s（含 spawn worker），第二个 48.1 s，出图正确 |
+| 门槛调大验证 | `minAvailableMb=30000` → 卡片显示「可用内存不足：17824 MB，需要 30000 MB」，开关自动回弹，**没有启动进程** |
+| 分辨率选 320 | 命令行 `-W 320 -H 320`，请求 76.0 s，出图正确 |
+| 运行中参数图标 | 置灰，点击弹 Toast 提示先停服务 |
+| 卡片 UI | `运行中 :7800` + 分辨率 chips + 打开 WebUI + 局域网地址 |
+
+### 26.8 遗留
+
+- **App 重启后部署列表为空**：`am force-stop` 后要重新点「部署」。服务列表没有持久化，属于体验问题。
+- 512² 的 VAE 仍是大头（~79 s），与本次无关。
