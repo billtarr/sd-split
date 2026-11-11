@@ -646,7 +646,7 @@ DiT 的权重根本不在 RSS 里 —— 它们走 HTP 的 rpcmem/dma_buf。
 
 ---
 
-## 13. TE 下沉：末段 RSS 4.48 GB → 24 MB（2026-11-11）
+## 14. TE 下沉：末段 RSS 4.48 GB → 24 MB（2026-11-11）
 
 TE（Qwen3-VL-8B Q4_K_M，4.4 GB）整轮生成只在最前面用一次，却常驻整个进程。编码完释放即可。
 
@@ -692,6 +692,131 @@ cond_stage_model.reset();     // ← 真正释放 backend buffer 的是这一步
 
 `SD_DIT_RELEASE_TE` 只适合**一次性跑**（`chain.sh`）。常驻服务（`serve1.sh`）**必须关掉**：
 释放后再来的 prompt 没有编码器可用。默认值：`chain.sh` 里 `=1`，`serve1.sh` 里不设（即关）。
+
+---
+
+---
+
+## 15. 算子统计：66% 的时间花在一个退化的 RoPE 分解上（2026-11-11）
+
+`GGML_HEXAGON_OPSTAT=1` 让后端把 DSP 回传的 per-op 计时聚合成表，退出时打印
+（分段链的 worker 用 `_exit()` 跳过 atexit，再给 `GGML_HEXAGON_OPSTAT_CUM=1` 让它在每次
+`synchronize()` 输出累计表，取最后一张即可）。
+
+### 15.1 先确认口径
+
+DSP 每个 batch 都会回一份 `htp_prof_desc`（`usecs` + 启停 cycle），但**必须先调用
+`htp_iface_profiler(handle, mode=1)` 打开**，否则那块内存是脏的。第一次跑出来的
+`sum(op) = 199886 s` 比 16 s 的窗口大 1.2 万倍，就是没开 profiling 直接读缓冲区。
+
+打开后三个数字自洽：
+
+| 量 | 含义 | 256²/8 步三段合计 |
+|---|---|---|
+| `dsp-window` | `Σ rsp.usecs`，DSP 真正在跑我们的 batch 的时间 | **39.38 s** |
+| `sum(op)` | `Σ pd.usecs`，各 kernel 自报的时间 | 39.34 s |
+| `unattributed` | 上面两个的差：提交、线程同步、VTCM 申请、权重扫描 | **0.04 s（0.1%）** |
+
+**0.1% 就是「逐 op 转发」的全部代价**，可以忽略。之前担心的「每个 op 一次 IPC / 一次队列提交」
+并不存在——22 408 个 op 平均 1.76 ms，时间全在 kernel 里面。
+
+采样 wall 41 s，DSP 39.4 s → **host 侧只占 4%**。所以优化只能做在 op 内部。
+
+### 15.2 分布：RoPE 66%，矩阵乘 23%
+
+| 类 | 时间 | 占比 | 说明 |
+|---|---|---|---|
+| **RoPE（`REPEAT` + `MUL` @ `[2,64,265,32]`）** | **25.94 s** | **65.9%** | 每层 4 次 `REPEAT`（19.3 ms）+ 4 次 `MUL`（5.9 ms）= **101 ms/层/步** |
+| 矩阵乘（`MUL_MAT` + `MUL_MAT_NX`） | 8.92 s | 22.6% | 见 15.3，效率其实是健康的 |
+| `CONT` | 2.07 s | 5.3% | 8 300 次布局拷贝，0.25 ms/次 |
+| `SOFT_MAX` / `SWIGLU` / `SCALE` / `ADD` / `CONCAT` … | ~2.4 s | 6% | 都是 265 token 的小算子 |
+
+整层预算 153 ms/步，其中 RoPE 101 ms、矩阵乘 30 ms、注意力 17 ms、其它 5 ms。
+
+### 15.3 矩阵乘不是瓶颈
+
+按形状看单算子吞吐（`2×MAC/usec`）：
+
+| 形状 | GFLOPS | 说明 |
+|---|---|---|
+| `MUL_MAT q4_K 24576x265` | **7 673** | MLP gate/up，最大的一块 |
+| `MUL_MAT q4_K 4096x265` | **5 600~5 760** | proj / qkv |
+| `MUL_MAT q4_K 4096x265`（fused `MUL_MAT_NX`） | 3 400 | |
+| `MUL_MAT f32 128x256x32` | **35** | **注意力 QK^T**，15.7 ms/次 |
+| `MUL_MAT f32 265x256x32` | 400 | 注意力 ·V |
+
+量化权重那几块跑到 5.6~7.7 TFLOPS，比之前用 LLM prefill 反推的 4.3 TFLOPS 还高——
+**matmul 这条路没有多少油水了**。真正差的是 f32 注意力：QK^T 只有 35 GFLOPS
+（f32 走 HVX，且 N=265 太小，HMX 用不上），但它总共只占 8~11%。
+
+### 15.4 为什么 RoPE 会慢成这样
+
+`src/core/ggml_extend.cpp` 的 `ggml_ext_rope_apply()` 里，给 HTP 走的是 **interleaved 的手工分解**：
+
+```cpp
+x   = ggml_cont(ggml_permute(x, 0, 2, 1, 3));          // 整块转置
+x   = ggml_reshape_4d(x, 2, d_head/2, L, n_head*N);    // [2, 64, 265, 32]
+x   = ggml_cont(ggml_permute(x, 3, 0, 1, 2));          // 再转一次
+x_0 = ggml_view_3d(...);  x_1 = ggml_view_3d(...);
+x_0 = ggml_repeat(x_0, temp_x);                        // ← 把半向量复制成 2 宽
+x_1 = ggml_repeat(x_1, temp_x);
+x_out = add_inplace(mul(x_0, pe_0), mul(x_1, pe_1));
+```
+
+问题是 **`REPEAT` 的目标张量内层维 `ne0 = 2`**（因为要把 `[cos,-sin; sin,cos]` 的 2×2 旋转矩阵
+按位置乘上去）。HVX 一次要处理 128 B，这里只有 8 B，等于完全不能向量化：
+4.3 MB 的重复拷贝耗 19.3 ms ⇒ **225 MB/s**，比 DSP 上正常的 memcpy 慢一到两个数量级。
+每层 q、k 各一次，四次 REPEAT 就 77 ms。
+
+（`Rope::apply_rope` 还有一条 `sd_ggml_rope_op()` 自定义算子快路，但
+`ggml_backend_supports_op(HTP)` 不认，所以必然落到手工分解。）
+
+### 15.5 可做的优化（按收益排序，均未实施）
+
+1. **RoPE 换成原生 rope kernel**（收益最大）。HTP 后端本来就有 `htp/rope-ops.h`，
+   llama.cpp 的 `GGML_OP_ROPE` 在 HTP 上是直接支持的。把 interleaved 分支替换成一次
+   `ggml_rope_ext(x, ..., GGML_ROPE_TYPE_NORMAL, rot_dim)`，内层维回到 128，
+   同时干掉那两次 `cont` 转置。预期 65.9% → 5% 以内。
+   **风险**：`pe` 是预计算好的 cos/sin 表，`ggml_rope_ext` 收的是 freqs，末位精度会变，
+   md5 不会逐位一致，判据要改成 MAE/PSNR。
+2. **注意力 f32 → f16（或开 flash attn）**：QK^T 35 → 数百 GFLOPS 量级，省 8~11%。
+   注意 HTP fp16 是低精度路径（台账 `I-020`），要先量 MAE。
+3. `CONT`（5.3%）大部分由 RoPE 的 permute 产生，跟着第 1 条一起消失。
+4. 矩阵乘：**没有明显空间**，大块已经 5.6~7.7 TFLOPS。
+
+外推（只算 RoPE）：采样 5.11 → **≈1.9 s/it**，端到端 95.6 → **≈70 s**；
+RoPE + 注意力都修 → **≈1.6 s/it**。
+
+### 15.6 一个没解释的副产物
+
+末段 VAE 的 DSP 时间只有 **3.83 s**，而 VAE 解码 wall 是 **17.8 s**。
+15.2 的表里 `IM2COL` 一共 3.07 s，也就是说 **VAE 有 14 s 根本不在 DSP 上**
+（host 侧建图/重排，或 graph cut 掉回 CPU 的算子）。512² 的 VAE 要 152 s，
+大概率同源，值得单独查一次。
+
+---
+
+---
+
+## 16. 权重流式已整体删除（2026-11-11）
+
+分段（每段 11 层 ≈ 1450 MiB）之后流式没有任何用处，但它一直以「窗口不足时的兜底」名义留着。
+2026-11-11 决定彻底删掉，不留死代码。删掉的东西（`ggml-hexagon.cpp` 净 -242 行）：
+
+| 位置 | 内容 |
+|---|---|
+| session 成员 | `stream_budget/mapped/total_map/op_idx`、10 个计数器、4 个 `unordered_*` 集合 |
+| session 方法 | `stream_reserve()`（LRU 回收 + 必要时强 flush）、`stream_forget()` |
+| `shared_buffer` | `relinquish()` / `restore()`、`backup` / `saved_size` / `saved_base` / `relinquished` / `tensors` 登记 |
+| `mmap_tensor()` | 预算分支、映射失败重试、`stream_last_use` 记账 → 现在只剩「没映射就 map」 |
+| 其他 | `synchronize()` 的 `[stream]` 统计、`GGML_HEXAGON_MAPBUDGET` / `GGML_HEXAGON_RPCMEM_FREE` 解析 |
+
+**行为未变**：256² 出图 `md5 = 1ceb0cc0…`（与删除前逐位一致），采样 5.07~5.15 s/it，
+端到端 95.6 s；DiT 1450 + VAE 644 = 2094 MiB 仍在 2304 MiB 窗口内，一次 map 到底。
+
+**代价**：单进程加载整个 3.91 GiB DiT 会直接 `fastrpc_mmap` 失败，没有兜底了。
+所以 `tools/serve1.sh`（单进程常驻服务）和 `tools/pd_probe.sh`（双 PD 探针）随之一并删除，
+常驻服务只能走 `tools/serve.sh`（分段链）。
 
 ---
 

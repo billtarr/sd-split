@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <cmath>
 #include <initializer_list>
+#include <map>
 
 #ifdef _WIN32
 #    define WIN32_LEAN_AND_MEAN
@@ -132,15 +133,14 @@ size_t opt_mbuf_dyn    = 512ul * 1024 * 1024;      // max dynamic (compute) buff
 size_t opt_mbuf_static = 1ul * 1024 * 1024 * 1024; // max static (weight/KV) buffer size
 size_t opt_mbuf_total  = 0;                        // total buffer space limit (0 = unconstrained)
 
-// Serial (layer-major) weight streaming.
-// Weights stay resident in rpcmem; only the IOVA mapping window is rotated. A batch whose
-// inputs are no longer referenced by the queued ops gets unmapped before the next weight
-// buffer is mapped, so the working set stays under `mapbudget` and models larger than the
-// 2.2 GiB v73 IOVA window can still run.
-size_t opt_mapbudget   = 0;                        // IOVA mapping budget in bytes; 0 = disabled (map everything)
 bool   opt_skip_iface_munmap = false;              // diagnostics: skip htp_iface_munmap() to test for IOVA leaks
 bool   opt_map_nodelay = false;                    // force FASTRPC_MAP_FD instead of the delayed variant
-bool   opt_rpcmem_free = false;                    // reclaim IOVA by destroying the dma_buf (correct but copies data)
+
+// Aggregate per-op DSP timings and print a single table at exit (GGML_HEXAGON_OPSTAT=1).
+bool   opt_opstat      = false;
+// Print the cumulative opstat table at every synchronize(). Needed for split workers, which
+// leave through _exit() and therefore never run the atexit hook.
+bool   opt_opstat_cum  = false;
 
 int    opt_mm_select     = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
 int    opt_fa_select     = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
@@ -242,7 +242,7 @@ static void ggml_hexagon_dump_op_prof(const char * sess_name, const htp_opnode &
     }
 
     float mhz = op_usec > 0 ? (float) op_cycles / op_usec : 0.0f;
-    GGML_LOG_DEBUG("ggml-hex: %s profile-op %s|usec %u cycles %u start %u mhz %.1f%s\n",
+    fprintf(stderr, "ggml-hex: %s profile-op %s|usec %u cycles %u start %u mhz %.1f%s\n",
                    sess_name, htp_format_op(node, HTP_OPFMT_PROF).c_str(), op_usec, op_cycles, pd.cycles_start, mhz, pmu_str);
 }
 
@@ -259,7 +259,7 @@ static void ggml_hexagon_dump_batch_prof(const char * sess_name, const htp_opbat
                 rsp.n_traces[8], rsp.n_traces[9]);
     }
 
-    GGML_LOG_DEBUG("ggml-hex: %s profile-op OPBATCH|----|n-ops %u|%s|----|----|usec %u cycles %llu start %llu mhz %.1f\n",
+    fprintf(stderr, "ggml-hex: %s profile-op OPBATCH|----|n-ops %u|%s|----|----|usec %u cycles %llu start %llu mhz %.1f\n",
                    sess_name, rsp.n_ops, evt_str, rsp.usecs, (unsigned long long) batch_cycles, (unsigned long long) rsp.cycles_start, batch_mhz);
 }
 
@@ -272,10 +272,144 @@ static void ggml_hexagon_dump_trace_events(const char * sess_name, const htp_opb
                 const auto & e = trace_events[t * n_traces + idx];
                 bool is_stop = (e.info & 0x8000) != 0;
                 uint16_t info = e.info & 0x7FFF;
-                GGML_LOG_DEBUG("ggml-hex: %s trace-evt %s: thread %u info %u %s %u\n",
+                fprintf(stderr, "ggml-hex: %s trace-evt %s: thread %u info %u %s %u\n",
                                sess_name, htp_event_name(e.id), t, info, is_stop ? "stop" : "start", e.cycles);
             }
         }
+    }
+}
+
+// ** per-op statistics (GGML_HEXAGON_OPSTAT=1)
+//
+// The DSP returns one htp_prof_desc per op for every batch, regardless of GGML_HEXAGON_PROFILE,
+// so the host already has a complete accounting of where DSP time goes. Printing it line by line
+// is unusable (256x256/8 steps is ~100k ops), so we aggregate and print one table at exit.
+//
+// The numbers that matter, in this order:
+//   dsp-window   sum of rsp.usecs  -- how long the DSP was busy on our batches
+//   sum(op)      sum of pd.usecs   -- time attributed to actual kernel work
+//   unattributed dsp-window - sum(op) -- per-op dispatch, thread sync, VTCM acquire, weight scan.
+//                This is what "forwarding op by op" costs, and better kernels don't shrink it.
+struct opstat_rec {
+    uint64_t n     = 0;   // dispatches
+    uint64_t us    = 0;   // DSP-reported time
+    uint64_t macs  = 0;   // matmul family only
+    uint64_t fused = 0;   // dispatches that absorbed at least one fused neighbour
+    uint64_t bytes = 0;   // src0 bytes touched (matmul family only)
+};
+
+static std::map<std::string, opstat_rec> g_opstat_op;    // key: op name
+static std::map<std::string, opstat_rec> g_opstat_sig;   // key: op|src0 type|dst dims
+static std::map<std::string, opstat_rec> g_opstat_name;  // key: dst->name
+static uint64_t g_opstat_calls    = 0;
+static uint64_t g_opstat_batches  = 0;
+static uint64_t g_opstat_batch_us = 0;
+static uint64_t g_opstat_ops      = 0;
+static uint64_t g_opstat_op_us    = 0;
+static uint64_t g_opstat_macs     = 0;
+static bool     g_opstat_atexit   = false;
+
+static double opstat_gflops(uint64_t macs, uint64_t us) {
+    return us ? 2.0 * (double) macs / (double) us / 1000.0 : 0.0;
+}
+
+static void opstat_dump(const char * tag) {
+    if (g_opstat_ops == 0) {
+        return;
+    }
+    const double op_s   = (double) g_opstat_op_us / 1e6;
+    const double win_s  = (double) g_opstat_batch_us / 1e6;
+    const double unattr = win_s - op_s;
+
+    fprintf(stderr, "\n[opstat] (%s) graph-compute=%" PRIu64 " batches=%" PRIu64 " (%.1f ops/batch) dsp-ops=%" PRIu64 "\n",
+            tag, g_opstat_calls, g_opstat_batches,
+            g_opstat_batches ? (double) g_opstat_ops / (double) g_opstat_batches : 0.0, g_opstat_ops);
+    fprintf(stderr, "[opstat] dsp-window=%.3f s  sum(op)=%.3f s  unattributed=%.3f s (%.1f%%)\n",
+            win_s, op_s, unattr, win_s > 0 ? 100.0 * unattr / win_s : 0.0);
+    fprintf(stderr, "[opstat] matmul throughput = %.2f TFLOPS over sum(op); %.2f TFLOP total\n",
+            opstat_gflops(g_opstat_macs, g_opstat_op_us) / 1000.0, 2.0 * (double) g_opstat_macs / 1e12);
+
+    typedef std::pair<const std::string, opstat_rec> * rec_p;
+    std::vector<rec_p> vop, vsig;
+    for (auto & kv : g_opstat_op)  vop.push_back(&kv);
+    for (auto & kv : g_opstat_sig) vsig.push_back(&kv);
+    auto by_us = [](rec_p x, rec_p y) { return x->second.us > y->second.us; };
+    std::sort(vop.begin(),  vop.end(),  by_us);
+    std::sort(vsig.begin(), vsig.end(), by_us);
+
+    fprintf(stderr, "[opstat] --- by op ---\n");
+    for (size_t i = 0; i < vop.size() && i < 24; i++) {
+        const auto & r = vop[i]->second;
+        fprintf(stderr, "[opstat] %-18s n=%8" PRIu64 " us=%10.1f (%5.1f%%) fused=%7" PRIu64 " %7.1f GFLOPS  %6.1f MiB/call\n",
+                vop[i]->first.c_str(), r.n, (double) r.us,
+                100.0 * (double) r.us / (double) g_opstat_op_us, r.fused,
+                opstat_gflops(r.macs, r.us),
+                r.n ? (double) r.bytes / (double) r.n / 1048576.0 : 0.0);
+    }
+    std::vector<rec_p> vnm;
+    for (auto & kv : g_opstat_name) vnm.push_back(&kv);
+    std::sort(vnm.begin(), vnm.end(), by_us);
+    fprintf(stderr, "[opstat] --- by tensor name (top 16) ---\n");
+    for (size_t i = 0; i < vnm.size() && i < 16; i++) {
+        const auto & r = vnm[i]->second;
+        fprintf(stderr, "[opstat] %-40s n=%7" PRIu64 " us=%9.1f (%5.1f%%)\n",
+                vnm[i]->first.c_str(), r.n, (double) r.us,
+                100.0 * (double) r.us / (double) g_opstat_op_us);
+    }
+
+    fprintf(stderr, "[opstat] --- by shape (top 28) ---\n");
+    for (size_t i = 0; i < vsig.size() && i < 28; i++) {
+        const auto & r = vsig[i]->second;
+        fprintf(stderr, "[opstat] %-46s n=%7" PRIu64 " us=%9.1f (%5.1f%%) %7.1f GFLOPS\n",
+                vsig[i]->first.c_str(), r.n, (double) r.us,
+                100.0 * (double) r.us / (double) g_opstat_op_us, opstat_gflops(r.macs, r.us));
+    }
+    fflush(stderr);
+}
+
+static void opstat_add(const std::vector<htp_opnode> & nodes, const htp_prof_desc * pd, uint32_t n, uint32_t batch_us) {
+    if (!g_opstat_atexit) {
+        g_opstat_atexit = true;
+        atexit([] { opstat_dump("final"); });
+    }
+    g_opstat_batches++;
+    g_opstat_batch_us += batch_us;
+
+    for (uint32_t i = 0; i < n; i++) {
+        const htp_opnode & node = nodes[i];
+        const ggml_tensor * s0  = node.src0();
+        const ggml_tensor * dst = node.dst();
+        if (!dst) {
+            continue;
+        }
+        const std::string name = node.name();
+
+        // Only the matmul family has a meaningful MAC count; everything else is reported in us.
+        uint64_t macs = 0, bytes = 0;
+        if (s0 && name.compare(0, 7, "MUL_MAT") == 0) {
+            macs  = (uint64_t) ggml_nelements(dst) * (uint64_t) s0->ne[0];
+            bytes = (uint64_t) ggml_nbytes(s0);
+        }
+
+        char sig[160];
+        snprintf(sig, sizeof(sig), "%s|%s|%lldx%lldx%lld",
+                 name.c_str(), s0 ? ggml_type_name(s0->type) : "-",
+                 (long long) dst->ne[0], (long long) dst->ne[1], (long long) dst->ne[2]);
+
+        opstat_rec & r0 = g_opstat_op[name];
+        r0.n++; r0.us += pd[i].usecs; r0.macs += macs; r0.bytes += bytes;
+        r0.fused += node.fused.size() ? 1 : 0;
+
+        opstat_rec & rn = g_opstat_name[dst->name];
+        rn.n++; rn.us += pd[i].usecs; rn.macs += macs;
+
+        opstat_rec & r1 = g_opstat_sig[std::string(sig)];
+        r1.n++; r1.us += pd[i].usecs; r1.macs += macs; r1.bytes += bytes;
+        r1.fused += node.fused.size() ? 1 : 0;
+
+        g_opstat_ops++;
+        g_opstat_op_us += pd[i].usecs;
+        g_opstat_macs  += macs;
     }
 }
 
@@ -384,31 +518,7 @@ struct ggml_hexagon_session {
     void flush_pending(bool all = true);
 
     ggml_hexagon_shared_buffer * mmap_tensor(const ggml_tensor * t);
-    void stream_reserve(const ggml_hexagon_shared_buffer * keep, size_t need = 0);
-    void stream_forget(const ggml_hexagon_shared_buffer * sbuf);
 
-    // Serial (layer-major) weight streaming state
-    size_t   stream_budget     = 0;      // IOVA mapping budget, 0 = streaming disabled
-    size_t   stream_mapped     = 0;      // bytes currently mapped and accounted
-    size_t   stream_total_map   = 0;     // cumulative bytes ever mapped (reveals IOVA leak)
-    int64_t  stream_op_idx     = 0;      // monotonically increasing op counter
-    uint64_t stream_n_map      = 0;
-    uint64_t stream_n_unmap    = 0;
-    uint64_t stream_n_reap     = 0;
-    uint64_t stream_n_relinq   = 0;      // buffers whose dma_buf was destroyed (rpcmem_free)
-    uint64_t stream_n_restore  = 0;      // buffers re-allocated and copied back
-    uint64_t stream_bytes_copy = 0;      // bytes copied host<->device by relinquish/restore
-    double   stream_ms_relinq  = 0;
-    double   stream_ms_restore = 0;
-    double   stream_ms_wait    = 0;      // time blocked in flush_pending() from the reap path
-    double   stream_ms_map     = 0;
-    double   stream_ms_unmap   = 0;
-    uint64_t stream_dbg_cnt    = 0;      // synchronize() call counter, used to rate-limit stats
-
-    std::unordered_set<ggml_hexagon_shared_buffer *> stream_mapped_set;  // buffers we account for
-    std::unordered_set<ggml_hexagon_shared_buffer *> stream_batch_need;  // referenced by the not-yet-flushed batch
-    std::unordered_set<ggml_hexagon_shared_buffer *> stream_op_need;     // referenced by the op being enqueued
-    std::unordered_map<ggml_hexagon_shared_buffer *, int64_t> stream_last_use;  // buffer -> last op index that touched it
     bool clone_buffer(const ggml_hexagon_shared_buffer*);
     void release_buffer(const ggml_hexagon_shared_buffer*);
     void unclone_buffer(const ggml_hexagon_shared_buffer*);
@@ -498,16 +608,6 @@ struct ggml_hexagon_shared_buffer {
     bool     pinned;
     bool     extended;
 
-    // Relinquish/restore support.
-    // fastrpc_munmap does not return the IOVA range to the DSP allocator, so the only way to
-    // reclaim it is to destroy the underlying dma_buf with rpcmem_free(). That loses the data,
-    // so the contents are kept in a host-side copy and copied back after re-allocation.
-    std::vector<ggml_tensor *>                   tensors;      // tensors carved out of this buffer
-    std::vector<uint8_t>                         backup;       // host-side copy while relinquished
-    size_t                                       saved_size = 0;
-    uint8_t *                                    saved_base = nullptr;
-    bool                                         relinquished = false;
-
     const char * c_name() const { return sess->c_name(); }
     uint8_t *    base()   const { return mem ? mem->base : nullptr; }
     size_t       size()   const { return mem ? mem->size : 0;  }
@@ -581,52 +681,6 @@ struct ggml_hexagon_shared_buffer {
         HEX_VERBOSE("ggml-hex: %s release ref on buffer: base %p size %zu fd %d\n", sess->c_name(),
                     (void *) base(), size(), fd());
         this->mem  = nullptr;
-    }
-
-    // Destroy the dma_buf so the DSP-side IOVA range is genuinely returned (unmap alone does not
-    // do it), keeping the contents in a host-side copy.
-    void relinquish() {
-        if (relinquished || !mem) return;
-        GGML_ASSERT(!pinned);
-        unmap();
-
-        saved_size = size();
-        saved_base = base();
-        backup.resize(saved_size);
-        memcpy(backup.data(), saved_base, saved_size);
-
-        mem.reset();          // rpcmem_free -> dma_buf released -> IOVA returned
-        relinquished = true;
-    }
-
-    // Re-allocate the dma_buf, copy the saved contents back and re-point the tensors.
-    void restore() {
-        if (!relinquished) return;
-
-        auto blk = std::make_shared<ggml_hexagon_rpcmem_block>(saved_size);
-        uint8_t * nb = blk->base;
-        memcpy(nb, backup.data(), saved_size);
-        // Re-point every tensor that still holds an address inside the block we just freed.
-        // Membership is re-evaluated here (not at relinquish) because sd.cpp moves the same
-        // tensor objects between buffers when it re-stages params.
-        int n_fixed = 0;
-        for (auto * t : tensors) {
-            const uint8_t * d = (const uint8_t *) t->data;
-            if (!d || d < saved_base || d >= saved_base + saved_size) continue;
-            t->data = nb + (size_t) (d - saved_base);
-            n_fixed++;
-        }
-        if (n_fixed == 0) {
-            fprintf(stderr, "ggml-hex: %s restore: no tensor to re-base (base %p -> %p size %zu)\n",
-                    sess->c_name(), (void *) saved_base, (void *) nb, saved_size);
-        }
-
-        mem = std::move(blk);
-        backup.clear();
-        backup.shrink_to_fit();
-        relinquished = false;
-
-        mmap();
     }
 
     ggml_hexagon_shared_buffer(ggml_hexagon_session * sess, size_t size, bool pinned = false) {
@@ -734,7 +788,6 @@ inline ggml_tensor ggml_hexagon_session::make_fence_tensor(const volatile void *
 
 static void ggml_backend_hexagon_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     auto sbuf = static_cast<ggml_hexagon_shared_buffer *>(buffer->context);
-    sbuf->sess->stream_forget(sbuf);
     sbuf->sess->unclone_buffer(sbuf);
     delete sbuf;
 }
@@ -759,16 +812,6 @@ static enum ggml_status ggml_backend_hexagon_buffer_init_tensor(ggml_backend_buf
         fprintf(stderr, "ggml-hex: %s INIT BAD OFFSET %s : data %p base %p size %zu nbytes %zu\n",
                 sess->c_name(), tensor->name, (void *) tensor->data, (void *) sbuf->base(),
                 sbuf->size(), ggml_nbytes(tensor));
-    }
-
-    // Remember which tensors live here: when the buffer is relinquished and later re-allocated at
-    // a different address, their data pointers have to be re-based.
-    if (!sbuf->pinned) {
-        // Ownership is decided by where the tensor's data actually points (see relinquish()),
-        // not by t->buffer: sd.cpp may call init_tensor() before it assigns same.
-        if (std::find(sbuf->tensors.begin(), sbuf->tensors.end(), tensor) == sbuf->tensors.end()) {
-            sbuf->tensors.push_back(tensor);
-        }
     }
 
     return GGML_STATUS_SUCCESS;
@@ -1477,13 +1520,11 @@ struct ggml_hexagon_opbatch {
         uint64_t t_offset = (uint8_t *) t->data - sbuf->base();
 
         // The DSP computes the tensor address as buf.base + offset and faults with a "Bad VA" if
-        // that lands outside the mapping. A tensor whose data pointer was not re-based after the
-        // buffer was relinquished/restored shows up here as an out-of-range offset.
+        // that lands outside the mapping.
         if (t_offset + ggml_nbytes(t) > sbuf->size()) {
-            const bool in_list = std::find(sbuf->tensors.begin(), sbuf->tensors.end(), (ggml_tensor *) t) != sbuf->tensors.end();
-            fprintf(stderr, "ggml-hex: %s add-tensor BAD OFFSET %s : data %p base %p offset %zu nbytes %zu buf-size %zu relinquished %d in-list %d n-tensors %zu owner %p sbuf %p usage %d\n",
+            fprintf(stderr, "ggml-hex: %s add-tensor BAD OFFSET %s : data %p base %p offset %zu nbytes %zu buf-size %zu owner %p sbuf %p usage %d\n",
                     sess->c_name(), t->name, (void *) t->data, (void *) sbuf->base(), (size_t) t_offset,
-                    ggml_nbytes(t), sbuf->size(), (int) sbuf->relinquished, (int) in_list, sbuf->tensors.size(),
+                    ggml_nbytes(t), sbuf->size(),
                     t->buffer->context, (void *) sbuf, (int) ggml_backend_buffer_get_usage(t->buffer));
         }
 
@@ -1708,7 +1749,7 @@ struct ggml_hexagon_opqueue {
         req.n_tensors = op_batch->n_tens;
         req.n_ops     = op_batch->n_ops;
 
-        if (opt_profile) {
+        if (opt_profile || opt_opstat) {
             op_cache[slot].assign(op_batch->ops.begin(), op_batch->ops.begin() + req.n_ops);
         }
 
@@ -1788,7 +1829,7 @@ struct ggml_hexagon_opqueue {
         uint8_t * m_ptr = (uint8_t*) dbuf.ptr;
         uint8_t * p_ptr = m_ptr + (b_size + t_size + o_size);
 
-        if (rsp.n_ops > 0 && opt_profile) {
+        if (rsp.n_ops > 0 && (opt_profile || opt_opstat)) {
             auto & ops = op_cache[slot];
             GGML_ASSERT(rsp.n_ops <= ops.size());
 
@@ -1798,13 +1839,19 @@ struct ggml_hexagon_opqueue {
                 trace_events = (const htp_trace_desc *) (p_ptr + p_size);
             }
 
-            ggml_hexagon_dump_batch_prof(shm_buf->sess->c_name(), rsp);
-
-            for (uint32_t i = 0; i < rsp.n_ops; i++) {
-                ggml_hexagon_dump_op_prof(shm_buf->sess->c_name(), ops[i], pd[i]);
+            if (opt_opstat) {
+                opstat_add(ops, pd, rsp.n_ops, rsp.usecs);
             }
 
-            ggml_hexagon_dump_trace_events(shm_buf->sess->c_name(), rsp, trace_events, shm_buf->sess->n_threads, n_traces);
+            if (opt_profile) {
+                ggml_hexagon_dump_batch_prof(shm_buf->sess->c_name(), rsp);
+
+                for (uint32_t i = 0; i < rsp.n_ops; i++) {
+                    ggml_hexagon_dump_op_prof(shm_buf->sess->c_name(), ops[i], pd[i]);
+                }
+
+                ggml_hexagon_dump_trace_events(shm_buf->sess->c_name(), rsp, trace_events, shm_buf->sess->n_threads, n_traces);
+            }
         }
     }
 };
@@ -1938,31 +1985,12 @@ void ggml_hexagon_session::flush_batch(size_t min_ops) {
     }
 
     op_batch->reset();
-    if (stream_budget > 0) stream_batch_need.clear();
 }
 
 void ggml_hexagon_session::enqueue_op(const htp_opnode & node) {
-    if (stream_budget > 0) {
-        stream_op_idx++;
-        // Reset first: the previous op may have returned early through the fusion path without
-        // clearing this set, and a stale entry would pin its buffers forever.
-        stream_op_need.clear();
-        // Reserve every buffer this op touches *before* mapping anything, so a reap triggered
-        // from mmap_tensor() can never evict an input we are about to hand to the DSP.
-        auto note = [this](const ggml_tensor * t) {
-            if (!t || !t->buffer || !t->buffer->context) return;
-            auto * sb = static_cast<ggml_hexagon_shared_buffer *>(t->buffer->context);
-            stream_op_need.insert(sb);
-            stream_batch_need.insert(sb);
-        };
-        for (auto t : node.get_inputs())  note(t);
-        for (auto t : node.get_outputs()) note(t);
-    }
-
     auto clone_tensor_buffer = [this](const ggml_tensor * t) {
         auto sbuf = this->mmap_tensor(t);
         if (!sbuf) return;
-        if (stream_budget > 0) stream_batch_need.insert(sbuf);
         if (sbuf->sess != this) {
             this->clone_buffer(sbuf);
         }
@@ -1995,15 +2023,6 @@ void ggml_hexagon_session::enqueue_op(const htp_opnode & node) {
     }
 
     op_batch->add_op(node);
-
-    if (stream_budget > 0) {
-        // Refresh LRU order here (not in mmap_tensor) so buffers that stay mapped across ops
-        // still sort correctly; then hand protection over to batch_need.
-        for (auto * sb : stream_op_need) {
-            stream_last_use[sb] = stream_op_idx;
-        }
-        stream_op_need.clear();
-    }
 }
 
 void ggml_hexagon_session::enqueue_mdev_group() {
@@ -2095,168 +2114,15 @@ void ggml_hexagon_session::enqueue_allreduce(
     this->enqueue_op(ar_node);
 }
 
-// Make room in the IOVA mapping window before mapping another weight buffer.
-//
-// Weights live in rpcmem the whole time; mapping only registers IOVA ranges, so rotating the
-// window is cheap in itself. The cost that matters is the barrier: a buffer cannot be unmapped
-// while the DSP might still touch it, so the pending batches have to drain first. Buffers that
-// the not-yet-flushed batch references are never reclaimed.
-void ggml_hexagon_session::stream_reserve(const ggml_hexagon_shared_buffer * keep, size_t need) {
-    if (need == 0) {
-        need = keep->size();
-    }
-    if (stream_mapped + need <= stream_budget) {
-        return;
-    }
-
-    stream_n_reap++;
-
-    // Drop the least recently used weight buffers that neither the pending batch nor the op
-    // currently being enqueued reference. Returns true if anything was released.
-    auto reap_pass = [&]() -> bool {
-        std::vector<std::pair<int64_t, ggml_hexagon_shared_buffer *>> cand;
-        cand.reserve(stream_mapped_set.size());
-        for (auto * sb : stream_mapped_set) {
-            if (sb == keep || !sb->mapped || sb->pinned) continue;
-            if (stream_batch_need.count(sb) || stream_op_need.count(sb)) continue;
-            auto it = stream_last_use.find(sb);
-            cand.emplace_back(it != stream_last_use.end() ? it->second : INT64_MAX, sb);
-        }
-        if (cand.empty()) {
-            return false;
-        }
-        std::sort(cand.begin(), cand.end());
-
-        for (auto & c : cand) {
-            if (stream_mapped + need <= stream_budget) break;
-            auto * sb = c.second;
-            if (opt_rpcmem_free) {
-                // Destroying the dma_buf is the only way the DSP actually gives the IOVA back.
-                const size_t sz = sb->size();
-                const auto t0 = std::chrono::steady_clock::now();
-                sb->relinquish();
-                stream_ms_relinq += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-                stream_bytes_copy += sz;
-                stream_mapped -= sz;
-                stream_n_relinq++;
-                // keep it in the mapped set: it will be restored on next use
-            } else {
-                const auto t_unmap = std::chrono::steady_clock::now();
-                sb->unmap();
-                stream_ms_unmap += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_unmap).count();
-                stream_mapped -= sb->size();
-                stream_mapped_set.erase(sb);
-                stream_n_unmap++;
-            }
-        }
-        return true;
-    };
-
-    // First try against batches already submitted: wait for the DSP to drain them.
-    const auto t_wait = std::chrono::steady_clock::now();
-    this->flush_pending(true);
-    stream_ms_wait += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_wait).count();
-
-    bool freed = reap_pass();
-
-    if (!freed && op_batch->n_ops > 0) {
-        // Everything mapped is still referenced by the batch that has not been submitted yet,
-        // which means the whole graph went into a single batch. Submit it, drain it, then reap.
-        // This is the point where layer-major serialization actually costs us: the batch has to
-        // end here instead of continuing to grow.
-        const auto t_flush = std::chrono::steady_clock::now();
-        this->flush_async();
-        this->flush_pending(true);
-        stream_ms_wait += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_flush).count();
-        freed = reap_pass();
-    }
-
-    if (stream_mapped + need > stream_budget) {
-        static int n_warn = 0;
-        if (n_warn++ < 3) {
-            fprintf(stderr, "ggml-hex: %s stream: IOVA window still short after reap (mapped %.1f MiB + need %.1f MiB > budget %.1f MiB, batch ops %u, mapped_set %zu, batch_need %zu, op_need %zu)\n",
-                    c_name(), stream_mapped / 1048576.0, need / 1048576.0, stream_budget / 1048576.0,
-                    op_batch ? op_batch->n_ops : 0u,
-                    stream_mapped_set.size(), stream_batch_need.size(), stream_op_need.size());
-        }
-    }
-}
-
-void ggml_hexagon_session::stream_forget(const ggml_hexagon_shared_buffer * sbuf) {
-    auto * sb = const_cast<ggml_hexagon_shared_buffer *>(sbuf);
-    if (stream_mapped_set.erase(sb) && sb->mapped) {
-        stream_mapped -= sb->size();
-    }
-    stream_batch_need.erase(sb);
-    stream_last_use.erase(sb);
-}
-
 ggml_hexagon_shared_buffer * ggml_hexagon_session::mmap_tensor(const ggml_tensor * t) {
     if (!t) return nullptr;
 
     auto sbuf = static_cast<ggml_hexagon_shared_buffer *>(t->buffer->context);
 
-    if (sbuf->relinquished) {
-        const size_t sz = sbuf->saved_size;
-        if (stream_budget > 0) {
-            this->stream_reserve(sbuf, sz);
-        }
-        const auto t_r = std::chrono::steady_clock::now();
-        sbuf->restore();
-        stream_ms_restore += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_r).count();
-        stream_bytes_copy += sz;
-        stream_mapped += sz;
-        stream_n_restore++;
-    }
-
-    // Register ownership here rather than in init_tensor(): sd.cpp stages params by swapping
-    // buffer/data between a managed tensor and a staging tensor, so the tensors our init_tensor()
-    // saw are no longer the ones the graph uses. Every tensor that actually reaches the DSP comes
-    // through this function, so this is the list restore() can trust.
-    if (!sbuf->pinned && sbuf->base()) {
-        const uint8_t * d = (const uint8_t *) t->data;
-        if (d >= sbuf->base() && d < sbuf->base() + sbuf->size() &&
-            std::find(sbuf->tensors.begin(), sbuf->tensors.end(), t) == sbuf->tensors.end()) {
-            sbuf->tensors.push_back(const_cast<ggml_tensor *>(t));
-        }
-    }
-
     if (!sbuf->mapped) {
         const bool is_weight = ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
         const bool extended  = opt_dma64 && is_weight;
-        if (stream_budget > 0 && is_weight) {
-            this->stream_reserve(sbuf);
-        }
-        const auto t_map = std::chrono::steady_clock::now();
-        if (stream_budget > 0 && is_weight) {
-            // Distinguish "IOVA return is merely delayed" from "never returned": a barely
-            // mapped window can transiently reject even though unmap() reported success.
-            for (int attempt = 0; ; attempt++) {
-                try {
-                    sbuf->mmap(extended);
-                    break;
-                } catch (const std::exception &) {
-                    if (attempt >= 2) {
-                        throw;
-                    }
-                    fprintf(stderr, "ggml-hex: %s mmap retry %d (mapped %.1f MiB, cum %.1f MiB)\n",
-                            c_name(), attempt + 1, stream_mapped / 1048576.0, stream_total_map / 1048576.0);
-                    std::this_thread::sleep_for(std::chrono::milliseconds(20));
-                }
-            }
-        } else {
-            sbuf->mmap(extended);
-        }
-        if (stream_budget > 0 && is_weight) {
-            stream_ms_map += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_map).count();
-            stream_mapped += sbuf->size();
-            stream_total_map += sbuf->size();
-            stream_mapped_set.insert(sbuf);
-            stream_n_map++;
-        }
-    }
-    if (stream_budget > 0) {
-        stream_last_use[sbuf] = stream_op_idx;
+        sbuf->mmap(extended);
     }
     return sbuf;
 }
@@ -2308,7 +2174,6 @@ void ggml_hexagon_session::release_buffer(const ggml_hexagon_shared_buffer * sbu
 }
 
 void ggml_hexagon_session::unclone_buffer(const ggml_hexagon_shared_buffer * sbuf) {
-    // A relinquished buffer has already destroyed its dma_buf, so no peer can still hold it.
     if (!sbuf || !sbuf->mem) return;
 
     auto mem = sbuf->mem;
@@ -2607,11 +2472,15 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
     this->valid_iface = true;
     GGML_LOG_INFO("ggml-hex: %s power mode: %s\n", this->c_name(), htp_power_mode_to_str(opt_power_mode));
 
-    if (opt_profile) {
+    // The DSP only fills the per-op prof descriptors once profiling has been switched on through
+    // the iface, so GGML_HEXAGON_OPSTAT needs the same call with mode 1 -- it just doesn't want the
+    // per-op dump that GGML_HEXAGON_PROFILE prints.
+    const int prof_mode = opt_profile ? opt_profile : (opt_opstat ? 1 : 0);
+    if (prof_mode) {
         htp_iface_pmu_conf pmu_conf{};
         std::copy(opt_pmu_evt.begin(), opt_pmu_evt.end(), pmu_conf.events);
 
-        err = htp_iface_profiler(this->handle, opt_profile, &pmu_conf);
+        err = htp_iface_profiler(this->handle, prof_mode, &pmu_conf);
         if (err != 0) {
             GGML_LOG_ERROR("ggml-hex: failed to enable profiling: 0x%08x\n", (unsigned) err);
         }
@@ -2685,7 +2554,6 @@ ggml_hexagon_session::ggml_hexagon_session(const ggml_hexagon_device_config & co
     op_queue         = nullptr;
     fence_buf        = nullptr;
     fence_seq        = ((uintptr_t)this) & 0xFFFF;
-    stream_budget    = (this->mdev.idx == 0) ? opt_mapbudget : 0;  // sub-sessions follow the main one
 
     try {
         allocate(config);
@@ -2730,8 +2598,7 @@ static void ggml_hexagon_tensor_repack(ggml_tensor * tensor, ggml_hexagon_sessio
     /*
      * Guard added during the sd.cpp port. sd.cpp calls graph_optimize from
      * ggml_backend_sched_reserve_size(), i.e. while *measuring* the graph, long
-     * before the weights have been loaded and possibly while the shared buffer is
-     * relinquished (mem == nullptr, so get_base() gives nullptr and every
+     * before the weights have been loaded (get_base() is nullptr then, so every
      * tensor->data degenerates to its buffer offset -- a hard segfault in the
      * repack memcpy). Only repack tensors that actually live in a live HTP buffer;
      * everything else is either CPU-resident or not loaded yet.
@@ -2767,6 +2634,10 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
 
     if (sess->last_error > HTP_STATUS_OK) {
         return GGML_STATUS_FAILED;
+    }
+
+    if (opt_opstat) {
+        g_opstat_calls++;
     }
 
     HEX_VERBOSE("ggml-hex: %s graph-compute n_nodes %d\n", sess->c_name(), graph->n_nodes);
@@ -2832,19 +2703,10 @@ static void ggml_backend_hexagon_synchronize(ggml_backend_t backend) {
         GGML_ABORT("ggml-hex: %s synchronize failed : dsp-error %s\n", sess->c_name(), status_to_str(sess->last_error));
     }
 
-    if (sess->stream_budget > 0 && (++sess->stream_dbg_cnt % 16) == 0) {
-        fprintf(stderr, "[stream] reap=%" PRIu64 " map=%" PRIu64 " (%.1f ms) unmap=%" PRIu64 " (%.1f ms) "
-                        "relinq=%" PRIu64 " (%.1f ms) restore=%" PRIu64 " (%.1f ms) copy=%.1f GiB "
-                        "wait=%.1f ms mapped=%.0f/%.0f MiB cum=%.0f MiB\n",
-                sess->stream_n_reap, sess->stream_n_map, sess->stream_ms_map,
-                sess->stream_n_unmap, sess->stream_ms_unmap,
-                sess->stream_n_relinq, sess->stream_ms_relinq,
-                sess->stream_n_restore, sess->stream_ms_restore,
-                sess->stream_bytes_copy / 1073741824.0,
-                sess->stream_ms_wait,
-                sess->stream_mapped / 1048576.0, sess->stream_budget / 1048576.0,
-                sess->stream_total_map / 1048576.0);
+    if (opt_opstat_cum) {
+        opstat_dump("cumulative");
     }
+
 }
 
 enum ggml_hexagon_mem_range_type {
@@ -3810,7 +3672,6 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_arch     = getenv("GGML_HEXAGON_ARCH");
     const char * str_vmem     = getenv("GGML_HEXAGON_VMEM");
     const char * str_mbuf     = getenv("GGML_HEXAGON_MBUF");
-    const char * str_mapbudget = getenv("GGML_HEXAGON_MAPBUDGET");
     const char * str_optrace  = getenv("GGML_HEXAGON_OPTRACE");
     const char * str_hostbuf  = getenv("GGML_HEXAGON_HOSTBUF");
     const char * str_dma64    = getenv("GGML_HEXAGON_DMA64");
@@ -3894,14 +3755,10 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     }
     opt_vmem    = str_vmem    ? parse_size(str_vmem)   : opt_vmem;
     opt_hostbuf = str_hostbuf ? atoi(str_hostbuf) != 0 : opt_hostbuf;
-    opt_mapbudget = str_mapbudget ? parse_size(str_mapbudget) : opt_mapbudget;
     opt_skip_iface_munmap = getenv("GGML_HEXAGON_SKIP_IFACE_MUNMAP") ? atoi(getenv("GGML_HEXAGON_SKIP_IFACE_MUNMAP")) != 0 : opt_skip_iface_munmap;
     opt_map_nodelay = getenv("GGML_HEXAGON_MAP_NODELAY") ? atoi(getenv("GGML_HEXAGON_MAP_NODELAY")) != 0 : opt_map_nodelay;
-    opt_rpcmem_free = getenv("GGML_HEXAGON_RPCMEM_FREE") ? atoi(getenv("GGML_HEXAGON_RPCMEM_FREE")) != 0 : opt_rpcmem_free;
-
-    if (opt_mapbudget > 0) {
-        GGML_LOG_INFO("ggml-hex: weight streaming enabled, IOVA mapping budget %.1f MiB\n", opt_mapbudget / 1048576.0);
-    }
+    opt_opstat = getenv("GGML_HEXAGON_OPSTAT") ? atoi(getenv("GGML_HEXAGON_OPSTAT")) != 0 : opt_opstat;
+    opt_opstat_cum = getenv("GGML_HEXAGON_OPSTAT_CUM") ? atoi(getenv("GGML_HEXAGON_OPSTAT_CUM")) != 0 : opt_opstat_cum;
 
     // Parse device configuration
     const char * str_devices  = getenv("GGML_HEXAGON_DEVICES");

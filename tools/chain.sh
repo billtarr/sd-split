@@ -1,6 +1,6 @@
 #!/system/bin/sh
 # chain.sh [tag] -- 链式分段：末段(22..32, 持有采样器) spawn 前驱(11..22)，后者再 spawn (0..11)。
-# 三进程全驻留（MAPBUDGET=1500M / RPCMEM_FREE=0），段间走 socketpair 乒乓。
+# 三进程全驻留（每段 11 层 ≈ 1450 MiB IOVA，一次 map 到底），段间走 socketpair 乒乓。
 # VAE 默认走 HTP0（CPU 58~67 s → HTP 18.8 s）。
 #
 # 可由环境变量覆盖（webui 用这套）：
@@ -17,8 +17,8 @@ H="${H:-256}"
 # 留空 = 用 sd.cpp 默认（物理核数）。手机上大小核混用，显式给小值往往更快。
 THREADS="${THREADS:-}"
 # VAE 跑哪个后端。HTP0 是定版：CPU 58~67 s → HTP 18.8 s，像素 MAE 0.030/255。
-# VAE 上 HTP 占 644 MB IOVA，所以 DiT 的预算要压到 1500M（1900M 装不下会挂）。
-# 回退到纯 CPU VAE：VAE_BACKEND=CPU GGML_HEXAGON_MAPBUDGET=1900M
+# VAE 上 HTP 占 644 MB IOVA，与 DiT 的 1450 MiB 合计 2094 MiB，仍在 2304 MiB 窗口内。
+# 回退到纯 CPU VAE：VAE_BACKEND=CPU
 VAE_BACKEND="${VAE_BACKEND:-HTP0}"
 VAE_THREADS=""
 
@@ -26,8 +26,6 @@ export LD_LIBRARY_PATH=lib
 export ADSP_LIBRARY_PATH=lib
 export GGML_HEXAGON_OPQUEUE=1
 export GGML_HEXAGON_MBUF=128M,128M
-export GGML_HEXAGON_MAPBUDGET="${GGML_HEXAGON_MAPBUDGET:-1500M}"
-export GGML_HEXAGON_RPCMEM_FREE="${GGML_HEXAGON_RPCMEM_FREE:-0}"
 
 export SD_DIT_SPLIT_PLAN="${SD_DIT_SPLIT_PLAN:-11,22}"
 export SD_DIT_LAYER_FIRST="${SD_DIT_LAYER_FIRST:-22}"

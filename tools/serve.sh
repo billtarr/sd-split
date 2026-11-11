@@ -8,7 +8,7 @@
 #   * SD_DIT_SPLIT_STEPS=8 —— 末段步号回绕，worker 靠 step 回到 0 判定「新请求」并重读 ctx.bin；
 #   * 末段（22..32）就是 sd-server 本身，HTTP 由它提供。
 #
-# 内存：末段 ~4.4 GB（TE+VAE+自己那 10 层），两个 worker 各 ~66 MB（不加载 TE/VAE）。
+# 内存：末段 TE 用完即释放（SD_DIT_RELEASE_TE 对常驻服务无效，见 chain.sh），两个 worker 各 ~66 MB。
 PORT="${1:-18080}"
 cd /data/local/tmp/qisplit || exit 1
 
@@ -16,8 +16,6 @@ export LD_LIBRARY_PATH=lib
 export ADSP_LIBRARY_PATH=lib
 export GGML_HEXAGON_OPQUEUE=1
 export GGML_HEXAGON_MBUF=128M,128M
-export GGML_HEXAGON_MAPBUDGET=1900M
-export GGML_HEXAGON_RPCMEM_FREE=0
 
 export SD_DIT_SPLIT_PLAN="${SD_DIT_SPLIT_PLAN:-11,22}"
 export SD_DIT_LAYER_FIRST="${SD_DIT_LAYER_FIRST:-22}"

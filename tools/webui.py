@@ -5,7 +5,7 @@
 两种后端，页面上可切：
 
   chain   : adb 跑设备上的 tools/chain.sh（**分段链**，三进程，采样 5.1 s/it，全权重常驻 NPU）
-  server  : 转发到设备上常驻的 sd-server（单进程 + IOVA 流式）
+  server  : 转发到设备上常驻的 sd-server（三段链，末段持有采样器）
 
 用法：
   python tools/webui.py                     # 默认 http://127.0.0.1:7860
