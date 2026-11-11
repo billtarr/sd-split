@@ -1267,3 +1267,56 @@ worker **没有采样器**（不跑 `sample()`），而 `t` 要进 DiT 的 modul
 
 日志特征：`split worker mode: layers [11, 22), no HTTP listener`、`split worker serving layers ...`；
 **没有** `conditioner released`（TE 保留），三张图内容都对（猫 / 红苹果 / 灯塔）。
+
+---
+
+## 24. TE 时间不稳定：根因不是抖动，是「首次」（2026-11-11 定案并修复）
+
+### 24.1 现象
+
+`I-044`：同一份二进制、同一组参数连跑四次，`get_learned_condition` 用掉 **6.49 / 21.20 / 33.44 s**，
+端到端 37.16~62.93 s，差异几乎全在这里。
+
+### 24.2 诊断：单调下降，说明是冷启动
+
+同一个常驻进程连发三个请求（prompt 各不相同，排除缓存）：
+
+```
+get_learned_condition completed, taking 22.65s
+get_learned_condition completed, taking  7.54s
+get_learned_condition completed, taking  5.58s
+```
+
+**单调下降、不反弹** —— 不是随机抖动，是「第一次」的一次性开销。三条证据指向同一件事：
+
+1. **CPU 频率根本没吃满**。编码时采样 `scaling_cur_freq`：cpu0（A510）1.67 GHz / cpu4（A715）1.92 GHz /
+   cpu7（X3）1.59 GHz，上限分别是 2.02 / 2.80 / 3.19 GHz。大核只跑到 50~69%。
+2. **8 线程被小核拖累**。TE 只编码 10~16 个 token，本质是「把 4.8 GB 权重扫一遍」的 GEMV：
+   sd.cpp 按行切分给 n_threads=8，其中 3 份落在 2.0 GHz 的 A510 上，同步屏障等它们。
+3. **内存有压力**。`SwapTotal 9.96 GB / SwapFree 8.24 GB`（已用 1.7 GB zram），`MemAvailable 9.6 GB`，
+   首次大批量缺页/回填的代价明显高于稳态。
+
+### 24.3 三个修复（都已落地）
+
+| 修复 | 做法 | 效果 |
+|---|---|---|
+| **TE 预热** | 新增 `sd_warmup_conditioner(ctx, rounds)`；`sd-server` 在 `svr.listen()` **之前**跑 2 轮（`SD_TE_WARMUP`，默认 2，0 = 关） | 首次请求从 22.6 s 的 TE 变成 3.6 s；服务启动多付 ~13 s（那时还没人请求） |
+| **cond 缓存** | sd.cpp 自带 `ConditioningCache`（LRU 4 条），相同 prompt 直接命中 | 同 prompt 第二次 TE = **0.00 s**，端到端 41 s |
+| **绑大核 + 5 线程** | `serve.sh` 默认 `AFFINITY=f8`（cpu3~7）+ `THREADS=5`；toybox 的 `taskset` 只认十六进制掩码、不认 `-c` 和 `0x` 前缀 | 预热 27.8 → **12.6 s**、TE 4.6 → 4.2 s、**连 sampling 都从 39.4 → 37.6 s**（worker 继承亲和性，host 线程不再被小核拖） |
+
+### 24.4 实测（v73，256²/8 步）
+
+| 配置 | 预热 2 轮 | 首请求 TE | 稳态 TE | 首请求 sampling | 稳态 sampling |
+|---|---|---|---|---|---|
+| 默认（8 线程 / 不绑核） | 27.82 s | 3.61 s | 4.58~4.68 s | 53.15 s | 39.35~39.80 s |
+| **`f8` + 5 线程（定版）** | **12.62 s** | 3.75 s | **4.22 s** | 48.81 s | **37.57 s** |
+| `f0` + 4 线程 | 15.22 s | 4.56 s | 4.56~5.04 s | 50.68 s | 38.18 s |
+
+端到端（常驻服务、全新 prompt）：**55 s**（改前 77.5~87.4 s）；相同 prompt 复用 cond：**41 s**。
+
+### 24.5 还没解决的
+
+稳态 4.2 s 对应 4.8 GB / 4.2 s ≈ **1.14 GB/s** 的有效带宽，只有 LPDDR5X（67 GB/s）的 1.7%。
+瓶颈是 CPU 侧 Q4_K 的反量化 GEMV 吞吐，不是带宽。要再压得改 kernel（NEON 手写 / i8mm 不可用，
+A510 不支持），或把 TE 挪出 CPU —— 但 4.8 GB 权重 > 2304 MB 的 fastrpc 窗口，HTP 侧放不下。
+**结论：4.2 s 是当前形态的合理下限。**

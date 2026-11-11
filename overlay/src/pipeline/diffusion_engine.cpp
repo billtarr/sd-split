@@ -177,6 +177,34 @@ bool StableDiffusionGGML::serve_split_worker() {
     return diffusion_model->serve_split_worker(n_threads > 0 ? n_threads : (int) sd_get_num_physical_cores());
 }
 
+bool StableDiffusionGGML::warmup_conditioner(int rounds) {
+    if (!cond_stage_model) {
+        LOG_WARN("TE warmup skipped: no conditioner loaded");
+        return false;
+    }
+    if (rounds < 1) {
+        return true;
+    }
+    const int64_t t0 = ggml_time_ms();
+    for (int i = 0; i < rounds; ++i) {
+        ConditionerParams params;
+        // 每轮换一句，避免命中 conditioning_cache_ 变成空转。
+        params.text   = i == 0 ? "warmup" : "warmup pass, a photo of a cat sitting on a wooden table";
+        params.width  = 256;
+        params.height = 256;
+        if (get_learned_condition(params).empty()) {
+            LOG_ERROR("TE warmup failed on round %d", i);
+            return false;
+        }
+    }
+    // 预热条目别占着 cache 槽位（capacity 4），真实 prompt 还要用。
+    conditioning_cache_->clear();
+    const int64_t t1 = ggml_time_ms();
+    LOG_INFO("TE warmup done: %d round(s), %.2fs (steady-state encode is what the requests will see)", rounds,
+             (t1 - t0) * 1.0f / 1000);
+    return true;
+}
+
 bool StableDiffusionGGML::release_conditioner() {
     if (!cond_stage_model) {
         return false;

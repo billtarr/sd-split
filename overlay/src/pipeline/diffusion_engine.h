@@ -222,6 +222,12 @@ public:
     // 没有采样器、不碰 TE/VAE。正常终止（末段关 fd）时进程内 _exit，返回值只用于报错。
     bool serve_split_worker();
 
+    // TE 预热：在还没有请求的时候先编码几次。
+    // 起因（I-044）：Qwen3-VL-8B Q4_K_M 在 CPU 上第一次编码要 22~33 s，之后 4~7 s —— 不是抖动，
+    // 是「首次」的一次性开销（权重页缺页 + CPU 从 idle 升频）。实测同一进程连跑：22.65 → 7.54 → 5.58 s。
+    // 把这笔开销挪到服务启动阶段（那时还没人发请求），用户看到的每个请求就都是稳态。
+    bool warmup_conditioner(int rounds);
+
     // 只释放文本编码器（Conditioner）—— 它只在最前面用一次，之后整轮生成都不需要。
     // 走 unregister_param_tensors(Conditioner) => erase_params_storage_block，真正归还 backend buffer。
     bool release_conditioner();

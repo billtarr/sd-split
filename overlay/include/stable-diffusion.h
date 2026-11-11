@@ -548,6 +548,11 @@ SD_API bool sd_ctx_supports_video_generation(const sd_ctx_t* sd_ctx);
 // channel/segment env (SD_DIT_SPLIT_FD, SD_DIT_LAYER_FIRST/LAST) to be set before the context is built.
 SD_API bool sd_serve_split_worker(sd_ctx_t* sd_ctx);
 
+// Text-encoder warmup: encode a couple of throwaway prompts so the first real request does not pay
+// the one-time cost (weight page faults + CPU ramp-up). Measured on v73: first encode 22-33 s,
+// steady state 4-7 s in the same process. Returns false if no conditioner is loaded.
+SD_API bool sd_warmup_conditioner(sd_ctx_t* sd_ctx, int rounds);
+
 // ControlNet hot-swap APIs are not safe to call while generation is in flight.
 SD_API bool sd_ctx_load_control_net(sd_ctx_t* sd_ctx, const char* path);
 SD_API bool sd_ctx_unload_control_net(sd_ctx_t* sd_ctx);

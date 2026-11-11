@@ -126,6 +126,20 @@ int main(int argc, const char** argv) {
         return 0;
     }
 
+    // ---- TE 预热 ----------------------------------------------------------------------------------
+    // Qwen3-VL-8B Q4_K_M 在 CPU 上第一次编码要 22~33 s，之后 4~7 s（同一进程连跑实测 22.65→7.54→5.58）。
+    // 这不是随机抖动，是「首次」的一次性开销：权重页缺页 + CPU 从 idle 升频 + 大块 buffer 首次触碰。
+    // 在 listen 之前先编两次，把这段开销挪到还没人发请求的窗口里。SD_TE_WARMUP=0 关掉，=N 指定轮数。
+    if (models.context) {
+        const char* warm = std::getenv("SD_TE_WARMUP");
+        const int   rounds = warm == nullptr ? 2 : std::atoi(warm);
+        if (rounds > 0) {
+            if (!sd_warmup_conditioner(models.context.get(), rounds)) {
+                LOG_WARN("TE warmup failed; the first request will pay the cold-start cost");
+            }
+        }
+    }
+
     std::mutex sd_ctx_mutex;
 
     std::vector<LoraEntry> lora_cache;

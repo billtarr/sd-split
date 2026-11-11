@@ -780,6 +780,14 @@ SD_API bool sd_serve_split_worker(sd_ctx_t* sd_ctx) {
     return sd_ctx->sd->serve_split_worker();
 }
 
+SD_API bool sd_warmup_conditioner(sd_ctx_t* sd_ctx, int rounds) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr) {
+        return false;
+    }
+    std::lock_guard<std::recursive_mutex> lock(sd_ctx->sd->execution_mutex);
+    return sd_ctx->sd->warmup_conditioner(rounds);
+}
+
 SD_API bool sd_ctx_load_control_net(sd_ctx_t* sd_ctx, const char* path) {
     if (sd_ctx == nullptr || sd_ctx->sd == nullptr || path == nullptr) {
         return false;

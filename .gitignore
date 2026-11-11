@@ -25,6 +25,10 @@ dump_*/
 # 调试/验证产物（接口返回、截图）
 resp*.json
 srv*.png
+e[0-9].json
+w[0-9].json
+f[0-9].json
+te_*.png
 /dist/
 qs-split-ctx.bin
 

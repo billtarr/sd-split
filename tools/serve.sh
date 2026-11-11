@@ -35,8 +35,11 @@ export SD_ROPE_NATIVE="${SD_ROPE_NATIVE:-1}"
 #    想稳妥就设 SD_FLASH_ATTN_MAX_KV=1024（默认值，512² 自动退回 f32 三段式）。
 export SD_FLASH_ATTN_MAX_KV="${SD_FLASH_ATTN_MAX_KV-0}"
 
-exec ./sd-server-hex \
-    --diffusion-model models/dit.gguf \
+# CPU 拓扑（v73）：cpu0-2 = A510 2.0 GHz，cpu3-6 = A715 2.8 GHz，cpu7 = X3 3.19 GHz。
+# TE（Qwen3-VL-8B Q4_K_M）在 CPU 上只做 10~16 token 的 GEMV，本质是「把 4.8 GB 权重扫一遍」，
+# 8 线程时 3 个小核各领一份行、成为同步瓶颈（实测编码时 cpu0 1.67 / cpu4 1.92 / cpu7 1.6 GHz，
+# 大核根本没吃满）。THREADS/AFFINITY 用来把它压到大核上。
+set -- --diffusion-model models/dit.gguf \
     --llm models/te.gguf \
     --vae models/vae.safetensors \
     --sigmas qwen-image-2.1-turbo \
@@ -46,3 +49,18 @@ exec ./sd-server-hex \
     --conv-direct "auto,vae=on" \
     --flash-attn "off,diffusion=on" \
     --listen-ip "${LISTEN_IP:-0.0.0.0}" --listen-port "$PORT"
+# 默认值：5 线程 + cpu3~7（4 个 A715 + X3）。实测（v73，256²/8 步）：
+#   默认 8 线程/不绑核：预热 27.8 s、TE 4.6 s、sampling 39.4 s
+#   f8 + 5 线程      ：预热 12.6 s、TE 4.2 s、sampling 37.6 s   ← 定版
+#   f0 + 4 线程      ：预热 15.2 s、TE 4.6 s、sampling 38.2 s
+# 想回退：AFFINITY= THREADS=  sh serve.sh
+THREADS="${THREADS-5}"
+AFFINITY="${AFFINITY-f8}"
+[ -n "${THREADS:-}" ] && set -- "$@" -t "$THREADS"
+
+# AFFINITY 是十六进制 CPU 掩码（toybox 的 taskset 不认 -c/list 形式，也不要 0x 前缀）：
+#   f8 = cpu3~7（4 个 A715 + X3）；f0 = cpu4~7；80 = 只 X3。
+if [ -n "${AFFINITY:-}" ]; then
+    exec taskset "$AFFINITY" ./sd-server-hex "$@"
+fi
+exec ./sd-server-hex "$@"
