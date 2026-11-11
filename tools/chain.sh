@@ -37,6 +37,9 @@ export SD_DIT_CTX_FILE="${SD_DIT_CTX_FILE:-/data/local/tmp/qisplit/qs-split-ctx.
 # TE（Qwen3-VL-8B Q4_K_M，4.4 GB）编码完就释放：末段 RSS 4.48 GB -> 24 MB，代价约 +6 s。
 # 只在「一次性跑」下安全（同进程不会再编码新 prompt）；常驻服务模式必须关掉。
 export SD_DIT_RELEASE_TE="${SD_DIT_RELEASE_TE:-1}"
+# 原生 M-RoPE 内核：速度 3×（1.83 s/it vs 5.11），但数值还没和 pe 路径对齐（出图 MAE 66.9/255），
+# 所以默认关闭。要试验：SD_ROPE_NATIVE=1。
+export SD_ROPE_NATIVE="${SD_ROPE_NATIVE:-0}"
 
 [ -n "$SD_DIT_DUMP_DIR" ] && mkdir -p "$SD_DIT_DUMP_DIR"
 

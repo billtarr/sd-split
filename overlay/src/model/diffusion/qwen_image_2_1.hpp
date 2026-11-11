@@ -4,6 +4,7 @@
 #include "core/pe_cache.h"
 #include "model/diffusion/qwen_image.hpp"
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <fcntl.h>
@@ -1083,6 +1084,50 @@ namespace Qwen {
                         }
                     }
                     auto ctx = get_context(graph);
+                    // 原生 M-RoPE：建图前把 positions + 逐对频率修正挂到 runner ctx 上，
+                    // ggml_ext_rope_apply() 看到它们就走 HTP 的原生 rope 内核（见 ggml_extend.cpp）。
+                    // 关掉：SD_ROPE_NATIVE=0（回退到通用的「转置+repeat+mul」分解）。
+                    {
+                        // 默认关闭：速度是 3×（1.83 s/it vs 5.11），但数值与 pe 路径不一致
+                        // （出图 MAE 66.9/255），语义还没对齐。开着试：SD_ROPE_NATIVE=1。
+                        static const bool rope_native = []() {
+                            const char* e = getenv("SD_ROPE_NATIVE");
+                            return e != nullptr && atoi(e) != 0;
+                        }();
+                        if (rope_native && !cached && !layout.positions.empty()) {
+                            const int64_t n_tok  = (int64_t) layout.positions.size();
+                            const int64_t n_pair = config.head_dim / 2;
+                            if ((int64_t) config.axes_dim.size() == 3 &&
+                                config.axes_dim[0] / 2 + config.axes_dim[1] / 2 + config.axes_dim[2] / 2 == n_pair) {
+                                std::vector<int32_t> pos((size_t) (4 * n_tok), 0);
+                                for (int a = 0; a < 3; ++a) {
+                                    for (int64_t i = 0; i < n_tok; ++i) {
+                                        pos[(size_t) (a * n_tok + i)] = (int32_t) layout.positions[(size_t) i][(size_t) a];
+                                    }
+                                }
+                                // HTP/ggml 的 theta 指数用全局 n_dims，sd.cpp 的 pe 用逐轴 axes_dim；
+                                // ff[k] = 10000^(2*k_local/dim_axis - 2*k/head_dim) 把两者对齐。
+                                std::vector<float> ff((size_t) n_pair, 1.0f);
+                                int                  off = 0;
+                                for (int a = 0; a < 3; ++a) {
+                                    const int dim_a = config.axes_dim[(size_t) a];
+                                    for (int k = 0; k < dim_a / 2; ++k) {
+                                        const int kk = off + k;
+                                        ff[(size_t) kk] = powf(10000.0f,
+                                                              2.0f * (float) k / (float) dim_a -
+                                                              2.0f * (float) kk / (float) config.head_dim);
+                                    }
+                                    off += dim_a / 2;
+                                }
+                                // ggml 要求 positions 是 1D：长度 4*n_tok，4 个轴各占一段（见 htp/rope-ops.c）
+                                ctx.rope_positions    = make_input(sd::Tensor<int32_t>({4 * n_tok}, std::move(pos)));
+                                ctx.rope_freq_factors = make_input(sd::Tensor<float>({(int64_t) n_pair}, std::move(ff)));
+                                for (int a = 0; a < 3; ++a) {
+                                    ctx.rope_sections[a] = config.axes_dim[(size_t) a] / 2;
+                                }
+                            }
+                        }
+                    }
                     auto out = model.forward(&ctx, make_input(x), make_input(*inputs.timesteps), cached ? nullptr : make_input(context),
                                              ref_inputs, pe, layout, masks, checked_cache, joint_t);
                     if (!flash_attn_used) {

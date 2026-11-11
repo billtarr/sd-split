@@ -820,3 +820,87 @@ RoPE + 注意力都修 → **≈1.6 s/it**。
 
 ---
 
+---
+
+## 17. 原生 M-RoPE 内核：快 3×，但语义还没对齐（2026-11-11）
+
+`ggml_ext_rope_apply()` 里加了一条快路（`SD_ROPE_NATIVE=1` 打开，**默认关闭**）。
+
+### 17.1 做了什么
+
+```cpp
+// q/k: [d_head, n_head, L, N]，相邻对 (2j, 2j+1) 是旋转对
+auto x4 = ggml_reshape_4d(ctx, x, 2, d_head/2, n_head, L);
+x4      = ggml_cont(ctx, ggml_permute(ctx, x4, 1, 0, 2, 3));   // [pair, lane, n_head, L]
+x4      = ggml_reshape_3d(ctx, x4, d_head, n_head, L);          // 头维 = [偶数位|奇数位]
+x4      = ggml_rope_multi(ctx, x4, positions, freq_factors, d_head, sections,
+                          GGML_ROPE_TYPE_MROPE, 0, 10000.f, 1.f, 0.f, 1.f, 0.f, 0.f);
+```
+
+一次 `cont` + 一次原生 rope，替掉原来的「2×cont 转置 + 2×REPEAT + 2×MUL + ADD」。
+
+三条从源码里敲定的事实：
+
+| 事实 | 依据 |
+|---|---|
+| HTP 的 rope 内核里 **MROPE 必定是半切配对** | `htp/rope-ops.c:559` `is_neox = (mode & NEOX) \|\| (mode & MROPE)` |
+| `sections` 比较的是**对索引**不是头维 | `sector = (i0/2) % sect_dims`，故传 `axes_dim/2 = {8,28,28}` |
+| `theta_scale` 用**全局** n_dims，pe 用**逐轴** axes_dim | `theta_scale = powf(freq_base, -2/n_dims)` vs `rope_frequencies(dim=axes_dim[i])` |
+
+第三条差一个逐对修正：`freq_factors[k] = 10000^(2*k_local/dim_axis - 2*k/head_dim)`，
+内核按 `theta / ff` 应用（`rope_cache_hvx_32` 和标量路径都是除）。
+
+### 17.2 实测
+
+| | pe 路径（默认） | 原生 rope |
+|---|---|---|
+| 采样 | 5.07~5.15 s/it | **1.83~1.96 s/it** |
+| 端到端（256²/8 步） | 95.6 s | **68.3 s** |
+| 出图 | `md5 1ceb0cc0…` | **MAE 66.9/255、PSNR 10.6 dB（灰纹理）** |
+
+速度是真的（`REPEAT` 那 66% 直接消失），但图完全不对——像是**位置信息根本没生效**，
+即 rope 退化成了恒等（最可能：positions 没送到设备，全 0）。
+`SD_ROPE_NATIVE=0` 时 md5 逐位回到 `1ceb0cc0…`，说明开关本身是干净的。
+
+### 17.3 下一步
+
+把 q 在 rope 前后落盘，两条路径逐元素比：
+
+- native 输出 ≈ 输入 → positions 没上传（查 `make_input` 的 I32 路径）；
+- 差异有结构（只是角度不同）→ 频率/配对。
+
+---
+
+## 18. VAE 的 17.8 s 里有 14 s 在 CPU（2026-11-11）
+
+### 18.1 结论
+
+VAE 解码 wall **17.8 s**，但 DSP 只忙 **3.83 s**。用 `GGML_SCHED_DEBUG=2` 看分配：
+末段 VAE 图被切成 **31 段，HTP0 → CPU 交替**，其中 **15 段在 CPU**，
+每段边界还要在 host 之间搬 36~72 MB 的激活。
+
+### 18.2 谁掉到 CPU 了
+
+形态固定为 **IM2COL + MUL_MAT 这一对**（conv2d 走 im2col），共同点是 im2col 产物很大：
+
+| 节点 | im2col dst | 后端 |
+|---|---|---|
+| `node_925` | **324 MB** | CPU |
+| `node_947` | **162 MB** | CPU |
+| `node_961` | 36 MB | HTP0 |
+
+所以是**尺寸门槛**（在 36~162 MB 之间的某个常量），不是类型或形状问题。
+
+### 18.3 为什么 512² 更惨
+
+激活随像素线性涨，落 CPU 的层数和每段拷贝都变大，所以 512² 的 VAE 从 17.8 s → **152 s**（8.6×）。
+
+### 18.4 可试的修法（都未做）
+
+1. **让大卷积走 HTP 原生 `CONV_2D`**：`conv_direct.cpp` 的 auto 判定要求后端有 implicit GEMM，
+   HTP 被一刀切关掉。手动打开 `--conv2d-direct` 可能直接绕开 im2col。
+2. **im2col 分块**：内核里已经有 `owb` 分块的搜索循环，看是哪条判定把大尺寸那一档拒绝了。
+3. **换权重类型**：`GGML_HEXAGON_MM_SELECT` 之类，或把这几层的 bf16 转成 HTP 更擅长的量化格式。
+
+---
+
