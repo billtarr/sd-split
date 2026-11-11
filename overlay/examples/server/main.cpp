@@ -1,6 +1,8 @@
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <mutex>
+#include <sched.h>
 #include <string>
 #include <thread>
 #include <vector>
@@ -17,6 +19,31 @@
 #ifdef HAVE_INDEX_HTML
 #include "frontend/dist/gen_index_html.h"
 #endif
+
+// CPU 亲和性：`SD_CPU_AFFINITY=f8`（十六进制掩码，bit i = cpu i）。
+// 为什么要在进程内做而不是外面套 taskset：APK 里 exe 是被 ProcessBuilder 直接拉起的，
+// 中间没有 shell 可以插 taskset。而 sched_setaffinity 会被 fork/exec 的子进程继承，
+// 所以在这里设一次，spawn 出来的分段 worker 全部跟着绑——实测 sampling 也快了 6%
+// （host 侧线程不再被 A510 小核拖）。
+static void apply_cpu_affinity() {
+    const char* m = std::getenv("SD_CPU_AFFINITY");
+    if (m == nullptr || *m == '\0') {
+        return;
+    }
+    const unsigned long mask = std::strtoul(m, nullptr, 16);
+    cpu_set_t           set;
+    CPU_ZERO(&set);
+    for (int i = 0; i < 32; ++i) {
+        if (mask & (1UL << i)) {
+            CPU_SET(i, &set);
+        }
+    }
+    if (sched_setaffinity(0, sizeof(set), &set) != 0) {
+        LOG_WARN("SD_CPU_AFFINITY=%s failed: %s", m, std::strerror(errno));
+    } else {
+        LOG_INFO("cpu affinity mask 0x%lx applied", mask);
+    }
+}
 
 static void print_usage(const char* argv0, const std::vector<ArgOptions>& options_list) {
     std::cout << version_string() << "\n";
@@ -74,6 +101,7 @@ void sd_log_cb(enum sd_log_level_t level, const char* log, void* data) {
 }
 
 int main(int argc, const char** argv) {
+    apply_cpu_affinity();
     if (argc > 1 && std::string(argv[1]) == "--version") {
         std::cout << version_string() << "\n";
         return EXIT_SUCCESS;

@@ -1320,3 +1320,79 @@ get_learned_condition completed, taking  5.58s
 瓶颈是 CPU 侧 Q4_K 的反量化 GEMV 吞吐，不是带宽。要再压得改 kernel（NEON 手写 / i8mm 不可用，
 A510 不支持），或把 TE 挪出 CPU —— 但 4.8 GB 权重 > 2304 MB 的 fastrpc 窗口，HTP 侧放不下。
 **结论：4.2 s 是当前形态的合理下限。**
+
+---
+
+## 25. 进 Pocket Model Studio（APK 集成，2026-11-12）
+
+整条分段服务已经能作为**模型包**跑在 App 里，不再需要 adb / shell 脚本。
+
+### 25.1 为什么入口必须是 jniLibs 里的 `libsd_server.so`
+
+App 的 `targetSdk=35`，SELinux 只允许 exec APK 的 `nativeLibraryDir`（`apk_data_file`），
+app 私有目录一律 EPERM。所以：
+
+| 东西 | 放哪 | 原因 |
+|---|---|---|
+| `sd-server` 入口 | `app/src/main/jniLibs/arm64-v8a/libsd_server.so` | 唯一允许 exec 的位置；`RuntimeResolver.embedded()` 会优先用这份 |
+| DSP applet `libggml-htp-v73.so` | 同一个 jniLibs | adsprpc 守护进程读不了 0700 的私有目录，`ADSP_LIBRARY_PATH` 只给 nativeLibraryDir |
+| 权重 / manifest | `<modelDir>/weights`、`manifest.json` | 包内数据 |
+| 分段 worker | **不用单独准备** | spawn 是 `execv("/proc/self/exe")`，天然指回 `libsd_server.so`，同一个文件被 exec 三次 |
+
+`runtime/` 目录里只放一个 `VERSION` 就够：它的存在让 App 走「随包运行框架」分支，
+入口再从 jniLibs 找（包里那份 `runtime/bin/sd-server` 只是给 `pack_model check` 用的备份）。
+
+### 25.2 manifest 的关键几项
+
+```json
+"entry": { "bin": "sd-server", "portArg": "--listen-port",
+           "healthPath": "/sdapi/v1/options", "stopMode": "sigterm" },
+"env": { "SD_DIT_SPLIT_PLAN": "11,22", "SD_DIT_LAYER_FIRST": "22", "SD_DIT_LAYER_LAST": "32",
+         "SD_DIT_SPLIT_STEPS": "{steps}", "SD_DIT_SPLIT_EXIT": "0",
+         "SD_DIT_CTX_FILE": "{filesDir}/qisplit-ctx.bin", "SD_DIT_RELEASE_TE": "0",
+         "SD_CPU_AFFINITY": "f8", "SD_TE_WARMUP": "2",
+         "SD_ROPE_NATIVE": "1", "SD_FLASH_ATTN_MAX_KV": "0",
+         "GGML_HEXAGON_OPQUEUE": "1", "GGML_HEXAGON_MBUF": "128M,128M" }
+```
+
+- `stopMode: sigterm` → App 走 `terminateChain(modelDir)`，按 `/proc/<pid>/cmdline` 含模型目录
+  找整条链，先 TERM worker 再 TERM 父进程（**绝不能 kill -9**，会漏 fastrpc PD）。
+- `healthPath` 用 `/sdapi/v1/options`：sd-server 没有 `/health`，这个 GET 返回 200。
+- `SD_DIT_SPLIT_STEPS` 用 `{steps}` 占位，UI 改步数时 env 跟着变（App 的 ServiceInstance 支持 `{param}`）。
+- **`SD_CPU_AFFINITY`**：APK 里没法在外面套 `taskset`（ProcessBuilder 直接拉起 exe），
+  所以在 `main()` 开头调 `sched_setaffinity`，fork/exec 的子进程继承 —— 一个变量搞定整条链。
+
+### 25.3 实测（v73，256²/8 步）
+
+| | 结果 |
+|---|---|
+| App 启动 → `listening on 127.0.0.1:7800` | 含 TE 预热 44.4 s（App 里比 shell 的 12.6 s 慢，`prewarm` 先读了 9.7 GB 权重） |
+| 首个请求（含拉起两个 worker） | **61.3 s** |
+| 第二个请求（同 prompt，命中 cond 缓存） | **40.2 s** |
+| 进程形态 | 三个 `libsd_server.so`：末段（父）+ [11,22) + [0,11)，worker 各 ~16 MB RSS |
+| 出图 | 正确（猫） |
+| UI | 卡片显示「2.1 Turbo (3 段 NPU) / 随包运行框架 / 运行中 :7800」，局域网 192.168.1.8:7860 可访问 |
+
+### 25.4 打包与部署
+
+```bash
+# 1) 建包（权重用硬链接挂进来，不复制 9.7 GB）
+python tools/pack_model.py init  ./build/qwen-image-split --kind image --embed-runtime
+python tools/pack_model.py pack  ./build/qwen-image-split -o dist/qwen-image-2.1-turbo-split.mlm
+# → 9.26 GB，store 模式，dit/te 按 2 GiB 分片（Android 的 ZipInputStream 不支持 zip64）
+
+# 2) 装 APK（jniLibs 里的 libsd_server.so 必须是最新编译产物）
+gradle -p D:/pocket-model-studio assembleDebug --offline && adb install -r app-debug.apk
+
+# 3) 本机调试：直接用 run-as 布置目录（比走 9 GB 导入快）
+adb shell "run-as dev.pocketmodel.studio sh -c 'M=files/models/qwen-image-2.1-turbo-split; \
+  mkdir -p \$M/weights \$M/runtime; cp /data/local/tmp/qisplit/pkg_mf.json \$M/manifest.json; \
+  ln -sf /data/local/tmp/qisplit/models/dit.gguf \$M/weights/dit.gguf; ...'"
+
+# 4) 启动（App 需在前台跑过，ServiceHost 才注册了广播接收器）
+adb shell am broadcast -a dev.pocketmodel.studio.CMD --es cmd start --es model qwen-image-2.1-turbo-split
+adb forward tcp:7800 tcp:7800 && curl -s 127.0.0.1:7800/sdapi/v1/options
+```
+
+**注意**：上面第 3 步用符号链接指向 `/data/local/tmp/qisplit/models`，只是本机调试省 9.7 GB；
+正式分发要走进 `dist/*.mlm`（App 内 SAF 导入，解出的是真实文件）。
