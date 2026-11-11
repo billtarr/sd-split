@@ -1021,3 +1021,112 @@ HTP 有 `htp/flash-attn-ops.h`，但 sd.cpp 的 `sd_probe_flash_attention()` 对
 
 ---
 
+---
+
+## 21. Flash attention：256² 可用，512² 因 HMX 数值漂移被门槛挡住（2026-11-11）
+
+### 21.1 先说 auto 探测为什么是假阴性
+
+`flash attention auto: HTP0 -> off (insufficient probe memory)`。
+`sd_run_backend_probe()` 用 `ggml_backend_dev_memory()` 做前置检查，而 HTP 的上报是
+
+```cpp
+static void ggml_backend_hexagon_device_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {
+    *free  = opt_mbuf_total;    // 就是 GGML_HEXAGON_MBUF 的总和（我们设 128M,128M）
+    *total = opt_mbuf_total;
+}
+```
+
+跟真正的预算（2304 MB IOVA 窗口）不是一回事，也不含"可用"语义。
+注意 `capability.supported()`（探针图能不能建起来）在前、这个内存门槛在后，
+也就是说 **HTP 其实支持 `GGML_OP_FLASH_ATTN_EXT`**，只是被一个不适用的内存检查拦住了。
+
+所以用 `--flash-attn off,diffusion=on` 强制开（`tools/chain.sh` 已设为默认）。
+
+### 21.2 256²：真的更快
+
+| | 无 FA | FA（HMX） |
+|---|---|---|
+| 采样 | 1.92 s/it | **1.45~1.52 s/it** |
+| 单段 DSP 窗口 | 5.172 s | **3.982 s** |
+| 出图 | 基准 | **MAE 1.398/255、PSNR 39.15 dB** |
+
+单段算子分布的变化（DSP 5.172 → 3.982 s）：
+
+| | 无 FA | FA |
+|---|---|---|
+| `MUL_MAT` | 50.5%（其中 QK^T `f32 128x256x32` 24.4%、35.4 GFLOPS） | 33.8%（5776 GFLOPS） |
+| `SOFT_MAX` | 3.7% | 0 |
+| `FLASH_ATTN_EXT` | 0 | **5.7%**（0.227 s，替掉原来 ~1.5 s 的三段式） |
+
+256² 的 `MUL_MAT f32 128x256x32`（QK^T）和 PV 那两块彻底消失了。
+
+### 21.3 512²：HMX 数值不可用
+
+| 512²（4105 token） | 采样 | vs 无 FA | vs 对方内核 |
+|---|---|---|---|
+| 无 FA（f32 三段式） | 17.80 s/it | — | — |
+| FA · HMX（默认） | **5.56 s/it** | **MAE 24.60/255（PSNR 17.2）** | vs HVX 差 23.55 |
+| FA · HVX（`GGML_HEXAGON_FA_SELECT=1`） | 21.85 s/it | MAE 4.21/255（PSNR 30.0） | — |
+
+HMX 快 3.2×，但出图会换一只**毛色不同**的猫（构图、姿态、背景一致，只有颜色和细节变了）。
+三方对账能定位到是 HMX 单个内核的问题：
+
+- 256²（265 token）：HMX vs HVX 只差 **0.558/255**（47.6 dB），两者都对；
+- 512²（4105 token）：HMX vs HVX 差 **23.55/255**，而 HVX 离 f32 参考只有 4.21。
+
+→ 误差随 S 增长，最可能是 HMX 的 online-softmax 累加（4105 个 key 分 65 个 64-block）精度不够。
+DSP 侧是预编译的 applet，改不动。
+HVX 虽然准（4.21），但 **21.85 s/it 比不开 FA 还慢**，没有使用价值。
+
+### 21.4 按 token 数设门槛
+
+`ggml_extend.cpp` 的 `ggml_ext_attention_ext()` 里加了：
+
+```cpp
+if (can_use_flash_attn && sd_backend_is(backend, "HTP")) {
+    static const int64_t max_kv = [] {
+        const char* e = getenv("SD_FLASH_ATTN_MAX_KV");
+        return e != nullptr ? (int64_t) atoll(e) : (int64_t) 1024;
+    }();
+    if (max_kv > 0 && L_k > max_kv) can_use_flash_attn = false;
+}
+```
+
+256²（L_k = 265）走 FA，512²（L_k = 4105）自动退回 f32 三段式。
+`SD_FLASH_ATTN_MAX_KV=0` 可解除限制（想要 512² 的 3.2× 就得接受换一只猫）。
+
+⚠️ **1024 是启发值，只在 265 / 4105 两个点上验证过**，中间尺寸没测。
+
+### 21.5 一个必须说清楚的结论：256² 的瓶颈已经不在采样
+
+256²/8 步端到端 ~54 s，其中：
+
+| 段 | 耗时 |
+|---|---|
+| TE（Qwen3-VL-8B，CPU） | **~21 s** |
+| 采样（8 步 × 1.5 s） | ~12 s |
+| VAE 解码 | 1.55 s |
+| 首步建图 + 三段进程拉起等固定开销 | **~20 s** |
+
+所以 FA 在 256² 上省的那 3.7 s，端到端几乎看不出来（53.19 → 54.35 就是噪声）。
+**真正吃时间的是 TE 和固定开销。** 512² 才是采样占大头（142 s / 253 s）。
+
+**而且 TE 的耗时极不稳定。** 同一份二进制、同一组参数连跑四次，端到端
+**37.16 / 53.19 / 54.35 / 62.93 s**，差异几乎全在 `get_learned_condition completed`
+（**6.49 / 21.20 / 33.44 s**）；采样（1.47~1.52 s/it）和 VAE（1.55~1.56 s）都很稳。
+
+37.16 s 那次的分段：
+
+| 段 | 耗时 |
+|---|---|
+| TE | 6.49 s |
+| 采样（8 × 1.48 s） | 11.8 s |
+| VAE 解码 | 1.56 s |
+| 首步建图 + 三段进程拉起 | **~17 s** |
+
+TE 是 Qwen3-VL-8B Q4_K_M 跑在 CPU 上，抖动来自设备后台负载和热状态，不是代码问题。
+**要再压端到端，只能动 TE（更小的量化，或想办法上 HTP）或那 ~17 s 固定开销。**
+
+---
+

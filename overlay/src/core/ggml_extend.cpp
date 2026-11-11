@@ -1,6 +1,7 @@
 #include "core/ggml_extend.h"
 
 #include <cmath>
+#include <cstdlib>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -740,6 +741,19 @@ ggml_tensor* ggml_ext_attention_ext(GGMLRunnerContext* runner_ctx,
         if (mask != nullptr) {
             // TODO: figure out if we can bend t5 to work too
             can_use_flash_attn = can_use_flash_attn && mask->ne[3] == 1;
+        }
+        // HTP 的 HMX flash-attn 内核在 KV 很长时数值会漂：实测 265 token 时它与自己的 HVX
+        // 实现只差 0.56/255，4105 token 时差 23.6/255（与 f32 手工路径差 24.6，而 HVX 只差 4.2），
+        // 出图会换一只毛色不同的猫。误差随 S 增长，所以 KV 超过阈值时退回 f32 三段式。
+        // 阈值用 SD_FLASH_ATTN_MAX_KV（默认 1024，设 0 表示不限制）。
+        if (can_use_flash_attn && sd_backend_is(backend, "HTP")) {
+            static const int64_t max_kv = []() {
+                const char* e = getenv("SD_FLASH_ATTN_MAX_KV");
+                return e != nullptr ? (int64_t) atoll(e) : (int64_t) 1024;
+            }();
+            if (max_kv > 0 && L_k > max_kv) {
+                can_use_flash_attn = false;
+            }
         }
 
         if (can_use_flash_attn) {

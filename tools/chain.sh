@@ -45,6 +45,13 @@ export SD_ROPE_NATIVE="${SD_ROPE_NATIVE:-1}"
 # 而 im2col 产物在 256² 就有 324 MB，被尺寸门槛拒掉后整段回退 CPU（图被切成 31 段 HTP0/CPU 交替）。
 # 实测 VAE 解码 17.43 s → 1.55 s（11×），出图 MAE 0.57/255。回退：CONV_DIRECT=auto
 CONV_DIRECT="${CONV_DIRECT:-auto,vae=on}"
+# flash attention。默认强制 diffusion 开：sd.cpp 的 auto 探测在 HTP 上会以
+# "insufficient probe memory" 退出（它读 ggml_backend_dev_memory()，HTP 只上报 mbuf 总量），
+# 所以 auto 恒等于 off。
+# 注意 HTP 的 HMX 内核在 KV 很长时数值会漂，`ggml_extend.cpp` 里有按 token 数的门槛
+# （SD_FLASH_ATTN_MAX_KV，默认 1024）：256²(265 token) 走 FA，512²(4105) 自动退回 f32 三段式。
+# 完全关掉：FLASH_ATTN=off
+FLASH_ATTN="${FLASH_ATTN-off,diffusion=on}"
 
 [ -n "$SD_DIT_DUMP_DIR" ] && mkdir -p "$SD_DIT_DUMP_DIR"
 
@@ -56,6 +63,7 @@ CONV_DIRECT="${CONV_DIRECT:-auto,vae=on}"
   -H "$H" -W "$W" ${THREADS:+-t "$THREADS"} \
   --backend "diffusion=HTP0,vae=$VAE_BACKEND,te=CPU" \
   ${CONV_DIRECT:+--conv-direct "$CONV_DIRECT"} \
+  ${FLASH_ATTN:+--flash-attn "$FLASH_ATTN"} \
   -o "out_$TAG.png"
 
 echo "CHAIN exit=$?"
