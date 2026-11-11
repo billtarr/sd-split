@@ -310,38 +310,62 @@ panic 不自动重启 → 黑屏 / 发热 / 电源键无响应（只能长按或
 
 ---
 
-## 9. 服务模式（`sd-server`，2026-11-11）
+## 9. 服务模式（`sd-server`，2026-11-11 打通）
 
-两个脚本，按稳定度排序：
+**`tools/serve.sh` 现在可用**：末段就是 `sd-server`（持采样器 + HTTP），前两段是**常驻 worker**，
+第一次请求把 worker 拉起来并加载完模型，之后每个请求只有编码 + 采样 + 解码。
 
-| 脚本 | 形态 | 实测 |
-|---|---|---|
-| **`tools/serve1.sh`（推荐先跑）** | **不切分**，单进程 + IOVA 流式（`MAPBUDGET=1400M RPCMEM_FREE=1`） | **116.5 s / 110.4 s**（256²、8 步），出图 md5 与 `sd-cli` 基线**完全相同** |
-| `tools/serve.sh` | 分段链（末段 = `sd-server`，前两段 worker） | **暂不可用**，见下面的坑 |
+| 形态 | 实测（256² / 8 步，v73） |
+|---|---|
+| 首次请求（含拉起两个 worker + 各段加载） | **87.8 s** |
+| 第二个请求（换 prompt，worker 已在位） | **45.7 s** |
+| 第三个请求（320×192，换分辨率） | **43.0 s** |
+| 对照：`chain.sh` 一次性跑（每请求重付加载） | 77.3 s |
 
-启动：`adb shell "cd /data/local/tmp/qisplit && nohup sh serve1.sh 18080 > log_srv1.txt 2>&1 &"`，
-PC 侧 `adb forward tcp:18080 tcp:18080`，然后 `POST http://127.0.0.1:18080/sdapi/v1/txt2img`。
+启动：`adb shell "cd /data/local/tmp/qisplit && nohup sh serve.sh 18080 > log_srv.txt 2>&1 &"`，
+PC 侧直接 `POST http://<手机IP>:18080/sdapi/v1/txt2img`（默认 `LISTEN_IP=0.0.0.0`；
+只想本机就 `LISTEN_IP=127.0.0.1` + `adb forward`）。
 
 可用接口（见 `examples/server/api.md`）：`/sdapi/v1/txt2img`（A1111 风格，最省事）、
 `/v1/images/generations`（OpenAI 风格）、`/sdcpp/v1/img_gen`（原生 + 异步 job）。
 
-### ⚠️ 分段 + server 的已知坑：worker 会继承 argv 自己也去 listen
+### 9.1 原先的坑（已修）：worker 继承 argv 自己也去 listen
 
-`split_spawn_predecessor()` 是拿 `/proc/self/cmdline` 重新 `execv("/proc/self/exe")`。
-在 `sd-cli` 下这没问题（子进程跑完就退）；但在 `sd-server` 下，子进程**继承了 `--listen-port 18080`**，
-于是它也去 `svr.listen()`，日志里能看到第二个 `listening on: http://127.0.0.1:18080`，
-而它本该是一个被动的 worker → 请求发起后 3 分钟没有任何 `completed in`，链路实际卡死。
+`split_spawn_predecessor()` 拿 `/proc/self/cmdline` 重新 `execv("/proc/self/exe")`。
+在 `sd-cli` 下没问题（子进程跑完就退）；但在 `sd-server` 下子进程**继承了 `--listen-port 18080`**，
+也去 `svr.listen()`，永远走不到 `compute()` → 请求挂死。
 
-修法（未做）三选一：
-1. spawn 时不要 exec 自己，改成 exec **`sd-cli-hex`**（env `SD_DIT_CLI_PATH`）—— worker 用 CLI 形态跑，
-   天然没有 server loop；
-2. 给 worker 加 `SD_DIT_WORKER_MODE=1`，在 `main()` 里跳过 `svr.listen()`，只保留一个
-   「收 x → compute → 发 joint」的驱动循环；
-3. 至少在 spawn 时把 argv 里的 `--listen-port` 改成 `0`（能跑起来，但 worker 仍会浪费一次 bind 逻辑）。
+修法（采用第 2 条）：`examples/server/main.cpp` 在 `new_sd_ctx` 之后、起 HTTP 之前判
+`SD_DIT_SPLIT_WORKER`，走 `sd_serve_split_worker()`（新 C API）：
 
-另外两处为常驻 worker 准备好的改动（已编译，**未在 server 下验证**）：
-`SD_DIT_SPLIT_EXIT=0` 时 worker 不再早退；末段步号在 `split_steps` 后回绕到 0，
-worker 见到 step 0 就判定「新请求」并重读 `ctx.bin`（`split_ctx_hold_valid_ = false`）。
+```
+sd_ctx 建好 → worker? → yes: 不进 initialize_server_models / 不 listen，直接 serve_split_worker()
+                       → no : 原样起 HTTP
+```
+
+`serve_split_worker` 是纯驱动循环：`收 latent → compute 本段 → 发 joint`，**没有采样器**，
+日志里能看到 `split worker mode: layers [11, 22), no HTTP listener` 与 `split worker serving layers ...`，
+`ps` 里三个 `sd-server-hex` 分别停在 `inet_accept`（末段）/ `unix_stream_data_wait`（两个 worker）。
+
+### 9.2 关键前提：timestep 必须随 latent 一起下发
+
+worker 没有采样器就推不出这一步的 `t`，而 `t` 会进 modulation。所以段间帧加了第三个头字段
+（`step | ndim | timestep_bits`，NaN = 未知）。CLI 模式也改用它（以前各进程各算一遍同样的调度，
+是隐含约定；现在统一以末段为准）。顺带的好处：worker 对**分辨率、步数、prompt 一无所知也不会错位**，
+换分辨率不用重启——320×192 那次请求就是同一个常驻链直接出的。
+
+### 9.3 每请求重发 context
+
+`end_runners()` 里加了一条 `reset_split_state()`：末段每次生成结束把 `split_ctx_sent_` 清 0，
+下一个请求重新沿链发 `(-1, ctx)`。日志证据：第二请求 `ctx sent [4096, 14]`（新 prompt 的 token 数变了），
+两个 worker 各 `ctx recv [4096, 14]`。
+
+### 9.4 TE 释放判据改 `atoi(...) != 0`
+
+`image.cpp` 原先只看 `getenv("SD_DIT_RELEASE_TE") != nullptr`，`serve.sh` 里 `=0` 照样把 TE 放掉
+（日志有 `conditioner released`），第二个请求就没有编码器了。现在按值判断，常驻服务下 TE 常驻
+（末段 RSS 4.4 GB），一次性跑仍可 `=1` 省钱。
+
 
 ---
 
@@ -360,8 +384,8 @@ python tools/webui.py --port 8080 --server http://192.168.1.8:18080
 
 | 模式 | 后端 | 每张耗时 |
 |---|---|---|
-| **分段链（默认）** | adb 跑设备上的 `tools/chain.sh`（三进程，末段持采样器） | **126~129 s**（5.05~5.25 s/it） |
-| 单进程常驻 | 转发到设备上的 `sd-server`（`tools/serve1.sh`） | **110~117 s**（7.7 s/it） |
+| **分段链（默认）** | adb 跑设备上的 `tools/chain.sh`（三进程，末段持采样器） | **77 s**（4.5 s/it，含每请求重付加载） |
+| 常驻分段服务 | 直连设备上的 `tools/serve.sh`（末段 `sd-server` + 两个常驻 worker） | **45.7 s**（第二请求起） |
 
 `chain.sh` 现在吃 `PROMPT / STEPS / SEED / W / H / THREADS` 环境变量，所以页面上的参数真的生效。
 出图在设备上落到 `out_<tag>.png`，webui pull 回来再 base64 内联。
@@ -474,7 +498,7 @@ VAE_BACKEND=CPU GGML_HEXAGON_MAPBUDGET=1900M sh chain.sh mytag
    `1500 + 644 ≈ 2144` 才稳。
 2. `chain.sh` 的 `VAE_BACKEND` 只影响 `--backend vae=`，不动 TE（仍 CPU）。
 
-`serve1.sh`（单进程常驻）也已改成 `vae=HTP0`，预算保持 1400M（VAE 644 MB 另算，实测通过）。
+`serve.sh`（分段常驻，末段 `sd-server`）同样 `vae=HTP0`，见 §9。
 
 ### 11.4 还没验的
 
@@ -690,8 +714,9 @@ cond_stage_model.reset();     // ← 真正释放 backend buffer 的是这一步
 
 ### 13.3 什么时候不能开
 
-`SD_DIT_RELEASE_TE` 只适合**一次性跑**（`chain.sh`）。常驻服务（`serve1.sh`）**必须关掉**：
-释放后再来的 prompt 没有编码器可用。默认值：`chain.sh` 里 `=1`，`serve1.sh` 里不设（即关）。
+`SD_DIT_RELEASE_TE` 只适合**一次性跑**（`chain.sh`）。常驻服务（`serve.sh`）**必须关掉**：
+释放后再来的 prompt 没有编码器可用。默认值：`chain.sh` 里 `=1`，`serve.sh` 里显式 `=0`
+（注意判据已改成「值非 0」，早先只看变量存在，`=0` 也会放掉，见 §9.4）。
 
 ---
 

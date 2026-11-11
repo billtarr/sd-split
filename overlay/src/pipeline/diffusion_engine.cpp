@@ -164,6 +164,17 @@ void StableDiffusionGGML::end_runners() {
     for (auto& lora : runtime_lora_models)
         if (lora.model)
             lora.model->runner_end();
+    // 一次生成结束：让末段知道「下一个请求要重发 context」（服务模式常驻 worker 不会重读文件）。
+    if (diffusion_model)
+        diffusion_model->reset_split_state();
+}
+
+bool StableDiffusionGGML::serve_split_worker() {
+    if (!diffusion_model) {
+        LOG_ERROR("split worker: no diffusion model loaded");
+        return false;
+    }
+    return diffusion_model->serve_split_worker(n_threads > 0 ? n_threads : (int) sd_get_num_physical_cores());
 }
 
 bool StableDiffusionGGML::release_conditioner() {
@@ -697,7 +708,7 @@ void StableDiffusionGGML::load_alphas_cumprod() {
 // 三个进程叠起来把整机打进 OOM，进而触发 OPPO DeathHealer 的内核 panic（I-029）。
 static bool sd_split_worker_mode() {
     const char* w = getenv("SD_DIT_SPLIT_WORKER");
-    return w != nullptr && *w == '1';
+    return w != nullptr && atoi(w) != 0;
 }
 
 bool StableDiffusionGGML::init_model_loader(ModelLoader& model_loader, ModelConfig& configuration) {

@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fcntl.h>
 #include <fstream>
 #include <sys/socket.h>
@@ -113,28 +114,44 @@ namespace Qwen {
         return true;
     }
 
-    // 帧格式：int32 step | int32 ndim | int64 dims[ndim] | float32 data[numel]
-    inline bool qwen_image_21_send_tensor(int fd, int step, const sd::Tensor<float>& t) {
-        const int32_t hdr[2] = { step, static_cast<int32_t>(t.dim()) };
+    // 帧格式：int32 step | int32 ndim | uint32 timestep_bits | int64 dims[ndim] | float32 data[numel]
+    //
+    // timestep 必须跟着 latent 一起走：段的输入里 timestep 会进 modulation，中间的段没有采样器
+    // （常驻 worker 见 serve_split_worker），自己推不出这一步的 t。（CLI 模式下各进程步数/调度
+    // 相同，以前是各算各的；现在统一以末段发来的为准，NaN 表示「未知，用调用方自己的」。）
+    inline uint32_t qwen_image_21_ts_bits(float ts) {
+        uint32_t bits = 0;
+        std::memcpy(&bits, &ts, sizeof(bits));
+        return bits;
+    }
+
+    inline bool qwen_image_21_send_tensor(int fd, int step, const sd::Tensor<float>& t, float ts = std::nanf("")) {
+        const int32_t hdr[3] = { step, static_cast<int32_t>(t.dim()), static_cast<int32_t>(qwen_image_21_ts_bits(ts)) };
         return qwen_image_21_write_all(fd, hdr, sizeof(hdr)) &&
                qwen_image_21_write_all(fd, t.shape().data(), sizeof(int64_t) * static_cast<size_t>(t.dim())) &&
                qwen_image_21_write_all(fd, t.data(), sizeof(float) * static_cast<size_t>(t.numel()));
     }
 
-    inline bool qwen_image_21_recv_tensor(int fd, int * step, sd::Tensor<float>& t) {
-        int32_t hdr[2] = { 0, 0 };
+    inline bool qwen_image_21_recv_tensor(int fd, int * step, sd::Tensor<float>& t, float * ts = nullptr) {
+        int32_t hdr[3] = { 0, 0, 0 };
         if (!qwen_image_21_read_all(fd, hdr, sizeof(hdr))) {
             return false;
         }
         if (hdr[1] <= 0 || hdr[1] > 8) {
             return false;
         }
+        const uint32_t ts_bits = static_cast<uint32_t>(hdr[2]);
         std::vector<int64_t> shape(static_cast<size_t>(hdr[1]));
         if (!qwen_image_21_read_all(fd, shape.data(), sizeof(int64_t) * shape.size())) {
             return false;
         }
         if (step != nullptr) {
             *step = hdr[0];
+        }
+        if (ts != nullptr) {
+            float ts_value = 0.f;
+            std::memcpy(&ts_value, &ts_bits, sizeof(ts_value));
+            *ts = ts_value;
         }
         t.resize(shape);
         return qwen_image_21_read_all(fd, t.data(), sizeof(float) * static_cast<size_t>(t.numel()));
@@ -558,6 +575,8 @@ namespace Qwen {
         const char *  split_ctx_file  = nullptr;
         sd::Tensor<float> split_ctx_hold_;        // worker 缓存的 context（只读一次文件）
         bool              split_ctx_hold_valid_ = false;
+        // worker 从末段收到这一步的 timestep（进 modulation 用）。NaN = 没收到，退回自己的采样器。
+        float             split_ts_recv_ = std::nanf("");
         // 一次性跑（sd-cli）为 true：worker 服务完最后一步就退。服务模式（sd-server）设 0，
         // worker 常驻，靠 step 回到 0 判定新请求。
         bool              split_exit_ = true;
@@ -796,6 +815,42 @@ namespace Qwen {
 
         std::string get_desc() override { return "qwen_image_2_1"; }
 
+        // 常驻 worker 驱动入口（sd-server 用，见 docs/npu-split.md §9）。
+        //
+        // 不跑采样器：只重复「收 latent(+timestep) → compute → 发 joint」。x / context / timestep
+        // 全部来自 socket，所以本循环对分辨率、步数、prompt 一无所知也不会错位，换分辨率也不用重建。
+        // 之所以能脱离采样器，是因为 timestep 现在随 latent 一起下发（见帧格式），段的 modulation 不再依赖
+        // 「各进程各自跑一遍同样的调度」这个隐含前提。
+        bool serve_split_worker(int n_threads) override {
+            split_setup();  // 读 SD_DIT_SPLIT_FD / 拉起本段的前驱
+            if (!split_worker_) {
+                LOG_ERROR("qwen_image_2_1: serve_split_worker requires SD_DIT_SPLIT_FD");
+                return false;
+            }
+            sd::Tensor<float> timestep = sd::Tensor<float>::from_vector({ 0.f });
+            DiffusionParams   params;
+            params.timesteps = &timestep;  // 占位：真正用的是 socket 收到的 timestep
+            params.extra     = QwenImage21DiffusionExtra{};
+            LOG_WARN("qwen_image_2_1: split worker serving layers [%d, %d)", model.layer_first, model.layer_last);
+            for (;;) {
+                auto out = compute(n_threads, params);
+                if (out.empty()) {
+                    // 末段关闭 fd（或段内报错）→ 本段使命结束。直接 _exit：不要再跑 HTP 的析构。
+                    LOG_WARN("qwen_image_2_1: split worker loop ended");
+                    fflush(nullptr);
+                    _exit(0);
+                }
+            }
+            return true;
+        }
+
+        // 末段每次请求结束都要重发 context：常驻 worker 不会自己重读文件，也不会重新算 TE。
+        void reset_split_state() override {
+            if (!split_worker_ && split_prev_fd_ >= 0) {
+                split_ctx_sent_ = false;
+            }
+        }
+
         void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors, const std::string& prefix) override {
             model.get_param_tensors(tensors, prefix);
         }
@@ -826,8 +881,9 @@ namespace Qwen {
             if (split_worker_) {
                 int               rstep = split_step_;
                 sd::Tensor<float> rx;
+                float             rts = std::nanf("");
                 for (;;) {
-                    if (!qwen_image_21_recv_tensor(split_next_fd_, &rstep, rx)) {
+                    if (!qwen_image_21_recv_tensor(split_next_fd_, &rstep, rx, &rts)) {
                         LOG_ERROR("qwen_image_2_1: split worker recv latent failed (step %d)", split_step_);
                         return {};
                     }
@@ -854,8 +910,16 @@ namespace Qwen {
                               sd::tensor_shape_to_string(x.shape()).c_str());
                     return {};
                 }
-                x_local     = std::move(rx);
-                split_step_ = rstep;
+                x_local        = std::move(rx);
+                split_step_    = rstep;
+                split_ts_recv_ = rts;
+            }
+            // 段内 timestep：worker 一律用末段发来的 t（它没有采样器，自己推不出这一步的 t）。
+            sd::Tensor<float>       ts_hold;
+            const sd::Tensor<float>* ts_ptr = inputs.timesteps;
+            if (split_worker_ && std::isfinite(split_ts_recv_)) {
+                ts_hold = sd::Tensor<float>::from_vector({ split_ts_recv_ });
+                ts_ptr  = &ts_hold;
             }
             if (split_worker_ && split_ctx_hold_valid_) {
                 ctx_local = split_ctx_hold_;
@@ -879,7 +943,7 @@ namespace Qwen {
             }
 
             if (x.empty() || context.empty() || context.dim() < 2 || context.shape()[0] != config.context_dim ||
-                tensor_or_empty(inputs.timesteps).numel() != 1 ||
+                tensor_or_empty(ts_ptr).numel() != 1 ||
                 x.dim() != 4 || x.shape()[3] != 1 || x.shape()[2] != config.in_channels) {
                 LOG_ERROR("Qwen Image 2.1 requires an image latent and text conditioning with batch size 1 "
                           "(x %s ctx %s ctx-dim %d ctx-ne0 %lld ts %lld in_ch %d)",
@@ -887,7 +951,7 @@ namespace Qwen {
                           context.empty() ? "empty" : sd::tensor_shape_to_string(context.shape()).c_str(),
                           config.context_dim,
                           context.empty() ? -1LL : (long long) context.shape()[0],
-                          (long long) tensor_or_empty(inputs.timesteps).numel(),
+                          (long long) tensor_or_empty(ts_ptr).numel(),
                           config.in_channels);
                 return {};
             }
@@ -954,7 +1018,9 @@ namespace Qwen {
                     }
                     split_ctx_sent_ = true;
                 }
-                if (!qwen_image_21_send_tensor(split_prev_fd_, split_step_, x)) {
+                // timestep 跟着 latent 一起下发：中间段没有采样器，自己推不出这一步的 t。
+                const float send_ts = tensor_or_empty(ts_ptr).numel() == 1 ? ts_ptr->data()[0] : std::nanf("");
+                if (!qwen_image_21_send_tensor(split_prev_fd_, split_step_, x, send_ts)) {
                     LOG_ERROR("qwen_image_2_1: split send latent failed (step %d)", split_step_);
                     return {};
                 }
@@ -1032,11 +1098,6 @@ namespace Qwen {
                     checked_cache.flash_attn_used = &flash_attn_used;
                 }
                 const bool cached = active_cache.mode == QwenImage21PrefixCache::Mode::REUSE;
-                // 原生 M-RoPE 的输入张量必须活到 compute 结束：make_input 只登记
-                // backend_tensor_data_map[ptr->data]，真正拷贝发生在图分配之后。
-                // 传临时 Tensor 会留下悬垂指针（positions 变成垃圾 → rope 退化成恒等变换）。
-                sd::Tensor<int32_t> rope_pos_holder;
-                sd::Tensor<float>   rope_ff_holder;
                 mask_data.clear();
                 if (!cached) {
                     for (const auto& segment : layout.segments) {
@@ -1089,54 +1150,7 @@ namespace Qwen {
                         }
                     }
                     auto ctx = get_context(graph);
-                    // 原生 M-RoPE：建图前把 positions + 逐对频率修正挂到 runner ctx 上，
-                    // ggml_ext_rope_apply() 看到它们就走 HTP 的原生 rope 内核（见 ggml_extend.cpp）。
-                    // 关掉：SD_ROPE_NATIVE=0（回退到通用的「转置+repeat+mul」分解）。
-                    {
-                        // 默认开启：原生 M-RoPE 内核比「转置+repeat+mul」的通用分解快 3×
-                        // （5.07 -> 1.96 s/it），出图与 pe 路径 MAE 0.45/255（PSNR 48.9 dB）。
-                        // 关掉：SD_ROPE_NATIVE=0。
-                        static const bool rope_native = []() {
-                            const char* e = getenv("SD_ROPE_NATIVE");
-                            return e == nullptr || atoi(e) != 0;
-                        }();
-                        if (rope_native && !cached && !layout.positions.empty()) {
-                            const int64_t n_tok  = (int64_t) layout.positions.size();
-                            const int64_t n_pair = config.head_dim / 2;
-                            if ((int64_t) config.axes_dim.size() == 3 &&
-                                config.axes_dim[0] / 2 + config.axes_dim[1] / 2 + config.axes_dim[2] / 2 == n_pair) {
-                                std::vector<int32_t> pos((size_t) (4 * n_tok), 0);
-                                for (int a = 0; a < 3; ++a) {
-                                    for (int64_t i = 0; i < n_tok; ++i) {
-                                        pos[(size_t) (a * n_tok + i)] = (int32_t) layout.positions[(size_t) i][(size_t) a];
-                                    }
-                                }
-                                // HTP/ggml 的 theta 指数用全局 n_dims，sd.cpp 的 pe 用逐轴 axes_dim；
-                                // ff[k] = 10000^(2*k_local/dim_axis - 2*k/head_dim) 把两者对齐。
-                                std::vector<float> ff((size_t) n_pair, 1.0f);
-                                int                  off = 0;
-                                for (int a = 0; a < 3; ++a) {
-                                    const int dim_a = config.axes_dim[(size_t) a];
-                                    for (int k = 0; k < dim_a / 2; ++k) {
-                                        const int kk = off + k;
-                                        ff[(size_t) kk] = powf(10000.0f,
-                                                              2.0f * (float) k / (float) dim_a -
-                                                              2.0f * (float) kk / (float) config.head_dim);
-                                    }
-                                    off += dim_a / 2;
-                                }
-                                // ggml 要求 positions 是 1D：长度 4*n_tok，4 个轴各占一段（见 htp/rope-ops.c）
-                                rope_pos_holder = sd::Tensor<int32_t>({4 * n_tok}, std::move(pos));
-                                rope_ff_holder  = sd::Tensor<float>({n_pair}, std::move(ff));
-                                ctx.rope_positions    = make_input(rope_pos_holder);
-                                ctx.rope_freq_factors = make_input(rope_ff_holder);
-                                for (int a = 0; a < 3; ++a) {
-                                    ctx.rope_sections[a] = config.axes_dim[(size_t) a] / 2;
-                                }
-                            }
-                        }
-                    }
-                    auto out = model.forward(&ctx, make_input(x), make_input(*inputs.timesteps), cached ? nullptr : make_input(context),
+                    auto out = model.forward(&ctx, make_input(x), make_input(*ts_ptr), cached ? nullptr : make_input(context),
                                              ref_inputs, pe, layout, masks, checked_cache, joint_t);
                     if (!flash_attn_used) {
                         return static_cast<ggml_cgraph*>(nullptr);

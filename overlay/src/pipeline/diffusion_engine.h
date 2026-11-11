@@ -218,6 +218,10 @@ public:
 
     void end_runners();
 
+    // 常驻分段 worker 的主循环（sd-server 的 worker 分支调用）：只跑 DiT 的「收 latent → 算本段 → 发 joint」。
+    // 没有采样器、不碰 TE/VAE。正常终止（末段关 fd）时进程内 _exit，返回值只用于报错。
+    bool serve_split_worker();
+
     // 只释放文本编码器（Conditioner）—— 它只在最前面用一次，之后整轮生成都不需要。
     // 走 unregister_param_tensors(Conditioner) => erase_params_storage_block，真正归还 backend buffer。
     bool release_conditioner();

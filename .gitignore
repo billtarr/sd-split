@@ -22,6 +22,10 @@
 .push/
 out_*.png
 dump_*/
+# 调试/验证产物（接口返回、截图）
+resp*.json
+srv*.png
+/dist/
 qs-split-ctx.bin
 
 # python / 编辑器

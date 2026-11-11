@@ -669,7 +669,10 @@ namespace sd::pipeline {
         // SD_DIT_RELEASE_TE=1：所有文本编码都完成了，把 TE 的权重还回去。
         // TE（Qwen3-VL-8B Q4_K_M）常驻 4.4 GB，是末段 RSS 的绝大部分，而它整轮只用这一次。
         // cond 是深拷贝（sd::Tensor 自带 vector），释放后不受影响；但本进程不能再编码新 prompt。
-        if (getenv("SD_DIT_RELEASE_TE") != nullptr && sd->cond_stage_model) {
+        // 注意：判据必须是「值非 0」，不能只看变量存在 —— 服务模式（常驻、一个进程要编码多次）
+        // 会显式传 =0 关掉它，早先按存在判会把 TE 放掉，第二个请求就没有编码器了（I-045）。
+        const char* release_te = getenv("SD_DIT_RELEASE_TE");
+        if (release_te != nullptr && atoi(release_te) != 0 && sd->cond_stage_model) {
             sd->release_conditioner();
         }
 
