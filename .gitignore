@@ -29,6 +29,9 @@ e[0-9].json
 w[0-9].json
 f[0-9].json
 te_*.png
+apk*.json
+apk*.png
+s[0-9].png
 /dist/
 qs-split-ctx.bin
 
