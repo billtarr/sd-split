@@ -53,12 +53,11 @@ fi
 apply_overlay() {
   echo "→ 应用 overlay（相对上游的改动）"
   local n=0 rel
-  while IFS= read -r f; do
-    rel="${f#./}"
+  while IFS= read -r rel; do
     mkdir -p "$SD_SRC/$(dirname "$rel")"
-    cp "$f" "$SD_SRC/$rel"
+    cp "overlay/$rel" "$SD_SRC/$rel"
     n=$((n + 1))
-  done < <(cd overlay && find . -type f)
+  done < <(cd overlay && find . -type f | sed 's|^\./||')
   echo "  覆盖 $n 个文件"
 }
 apply_overlay
