@@ -32,6 +32,10 @@ te_*.png
 apk*.json
 apk*.png
 s[0-9].png
+r[0-9].json
+r[0-9].png
+s[a-z].png
+mf_test.json
 /dist/
 qs-split-ctx.bin
 
