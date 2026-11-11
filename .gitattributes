@@ -1,0 +1,7 @@
+* text=auto eol=lf
+
+# 预编译二进制：不要做换行/文本转换
+*.so binary
+*.bin binary
+*.png binary
+*.jpg binary

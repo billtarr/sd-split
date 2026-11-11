@@ -1,0 +1,31 @@
+# 本仓库提交的是「源码覆盖层 + 脚本 + 文档 + 两个预编译 .so」，
+# 不提交上游源码、构建产物、权重和运行日志。它们都能重新生成，权重太大且随时会换。
+
+# 上游源码（fetch_deps.sh 生成）
+/stable-diffusion.cpp-master/
+/ggml-master/
+/cl-headers/
+
+# 构建产物
+/build-*/
+*.o
+*.a
+*.new
+
+# 权重与依赖包（模型放 D 盘根目录，见 README）
+*.gguf
+*.safetensors
+*.tgz
+
+# 运行产物
+*.log
+.push/
+out_*.png
+dump_*/
+qs-split-ctx.bin
+
+# python / 编辑器
+__pycache__/
+*.pyc
+*~
+.*.un~
