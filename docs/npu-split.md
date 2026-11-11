@@ -1130,3 +1130,67 @@ TE 是 Qwen3-VL-8B Q4_K_M 跑在 CPU 上，抖动来自设备后台负载和热�
 
 ---
 
+---
+
+## 22. 常驻分段服务（serve.sh）当前不可用（2026-11-11）
+
+### 22.1 现象
+
+```sh
+sh serve.sh 18080        # 正常起来，日志里 listening on: http://0.0.0.0:18080
+POST /sdapi/v1/txt2img   # 永不返回（900 s 超时）
+```
+
+三个 `sd-server-hex` 全部停在 `inet_accept`，utime 不再增长；父进程日志停在
+
+```
+[W] qwen_image_2_1: split spawned predecessor pid 30123 for layers [11, 22)
+[W] qwen_image_2_1: ctx sent [4096, 13] numel 53248 (via socket)
+```
+
+worker 那侧则打出 `listening on: http://0.0.0.0:18080` —— 它把自己当成了另一个 HTTP 服务。
+
+### 22.2 根因
+
+分段 worker 是 `execv("/proc/self/exe", 原 argv)`（`qwen_image_2_1.hpp:641`），子进程拿同一份
+argv 重跑，靠"自己也会调用 generate"进入握手（握手机制挂在 `compute()` 里）：
+
+- **sd-cli**：main 解析完参数立刻 `generate_image()` → 进 `compute()` → 识别自己是 worker → 握手。
+- **sd-server**：main 解析完参数**去起 HTTP 监听** → 永远走不到 `compute()` → 父进程死等。
+
+`SD_DIT_SPLIT_WORKER` 只在 `diffusion_engine.cpp:698` 被读来跳过 TE/VAE 加载，
+**没有任何 main 用它做分发**，所以服务形态下这个变量等于没用。
+
+### 22.3 顺带发现的一个 bug
+
+`image.cpp` 的 TE 释放判据是
+
+```cpp
+if (getenv("SD_DIT_RELEASE_TE") != nullptr && sd->cond_stage_model) { ... }
+```
+
+**只看变量存在、不看值**。`serve.sh` 里写 `SD_DIT_RELEASE_TE=0` 照样会把 TE 放掉
+（服务日志里能看到 `conditioner released`）。所以即使握手修好，第二个请求也会因为没有编码器而失败。
+应该改成 `atoi(...) != 0`。
+
+### 22.4 当前能用的形态
+
+`python tools/webui.py`（PC 端，默认 `http://127.0.0.1:7860`）+ **chain 模式**：
+每次生成重新拉起三进程。实测
+
+| | 往返 | 采样 | generate |
+|---|---|---|---|
+| 256² | 57.6 s | 1.45 s/it | 50.0 s |
+| 512² | 158.3 s | 5.38 s/it（HMX FA） | 153.4 s |
+
+出图正常。代价就是每次多付一遍模型加载 + 建图（约 17 s）。
+
+### 22.5 要修的话
+
+1. `examples/server/main.cpp`：`SD_DIT_SPLIT_WORKER=1` 时不启 HTTP，直接跑一次生成以进入握手；
+2. `image.cpp`：TE 释放判据改 `atoi(...) != 0`。
+
+两处都还没动。
+
+---
+

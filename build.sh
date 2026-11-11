@@ -73,10 +73,15 @@ apply_overlay
   -DGGML_LLAMAFILE=OFF \
   "${EXTRA[@]}"
 
-"$CMAKE" --build "$BUILD" --target sd-cli -j "${JOBS:-$(nproc 2>/dev/null || echo 8)}"
+# sd-cli 是主力；sd-server 给常驻服务用（tools/serve.sh）。
+"$CMAKE" --build "$BUILD" --target sd-cli sd-server -j "${JOBS:-$(nproc 2>/dev/null || echo 8)}"
 
 ls -lh "$BUILD/bin/sd-cli"
 echo "✓ $BUILD/bin/sd-cli"
+if [ -f "$BUILD/bin/sd-server" ]; then
+  ls -lh "$BUILD/bin/sd-server"
+  echo "✓ $BUILD/bin/sd-server"
+fi
 if [ "$BACKEND" = "hexagon" ]; then
   cat <<'EOF'
 
@@ -84,6 +89,8 @@ if [ "$BACKEND" = "hexagon" ]; then
   STRIP=D:/ndk/android-ndk-r26d/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-strip.exe
   cp build-hex/bin/sd-cli /tmp/sd-cli-hex && "$STRIP" /tmp/sd-cli-hex
   adb push /tmp/sd-cli-hex /data/local/tmp/qisplit/sd-cli-hex
+  cp build-hex/bin/sd-server /tmp/sd-server-hex && "$STRIP" /tmp/sd-server-hex
+  adb push /tmp/sd-server-hex /data/local/tmp/qisplit/sd-server-hex
   adb push ref/hexagon/libggml-htp-v73.so /data/local/tmp/qisplit/lib/
 EOF
 fi

@@ -40,6 +40,9 @@ export SD_DIT_RELEASE_TE="${SD_DIT_RELEASE_TE:-1}"
 # 原生 M-RoPE 内核：采样 5.07 -> 1.96 s/it，出图与 pe 路径 MAE 0.45/255（PSNR 48.9 dB）。默认开。
 # 回退到通用的「转置+repeat+mul」分解：SD_ROPE_NATIVE=0
 export SD_ROPE_NATIVE="${SD_ROPE_NATIVE:-1}"
+# 放开 flash attention 的 token 门槛（默认 1024：512² 会退回 f32）。
+# 设 0 = 任何尺寸都走 HMX。⚠️ HMX 在 KV 很长时数值会漂，512² 与 f32 的 MAE 24.6/255。
+export SD_FLASH_ATTN_MAX_KV="${SD_FLASH_ATTN_MAX_KV-0}"
 # VAE 的卷积走哪条路。默认 "auto,vae=on" = 强制 VAE 用 HTP 原生 CONV_2D。
 # 原因：sd.cpp 的 auto 要求后端有 implicit GEMM，HTP0 上一律判 off → conv 退化成 IM2COL，
 # 而 im2col 产物在 256² 就有 324 MB，被尺寸门槛拒掉后整段回退 CPU（图被切成 31 段 HTP0/CPU 交替）。

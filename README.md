@@ -15,7 +15,7 @@ v73 每个 fastrpc PD 只有 **2304 MB** 的 IOVA 窗口，装不下 3.91 GiB �
 | NPU 单进程 + 权重流式（已移除） | 7.73 s/it | 58 s（CPU） | 133.8 s | `39595a07…` |
 | NPU 三段 + VAE 上 NPU | 5.05 s/it | 19.2 s | 85.1 s | `1ceb0cc0…` |
 | 上面再加 TE 用完即释放 | 5.10 s/it | 17.8 s | 91.7~96.6 s | `1ceb0cc0…` |
-| 当前默认（+ 原生 M-RoPE + VAE conv-direct + flash attn） | **1.45 s/it** | **1.55 s** | **~54 s** | MAE 1.4/255 vs 上表 |
+| 当前默认（+ 原生 M-RoPE + VAE conv-direct + flash attn 全解锁） | **1.45 s/it** | **1.55 s** | **~37~63 s** | MAE 1.4/255 vs 上表 |
 
 - 三段相对整模型：采样 **−34%**。全程 `mapped 1450 MiB` 常驻、**权重零搬运**——每段一次 map 到底，
   不做任何换入换出（流式代码已整体移除，见「已知限制」）。
@@ -120,6 +120,12 @@ ref/                libggml-htp-v73.so（DSP applet）、libcdsprpc.so（ABI 常
   参考只有 4.2。所以 `ggml_extend.cpp` 里按 token 数设了门槛（`SD_FLASH_ATTN_MAX_KV`，默认
   1024）：256² 走 FA，512² 自动退回 f32 三段式。**1024 是启发值，只在 265/4105 两个点验证过。**
   HVX 路径虽然准，但 512² 要 21.85 s/it，比不开 FA 的 17.80 还慢。
+- **常驻分段服务（`tools/serve.sh`）当前不可用**：`sd-server` 不能当分段 worker —— spawn 是
+  `execv("/proc/self/exe", 原 argv)`，sd-cli 的 main 会立刻开始生成（于是进入握手），
+  而 sd-server 的 main 去起 HTTP 监听，永远走不到 `compute()`，父进程在 socket 上死等。
+  另外 `image.cpp` 的 `SD_DIT_RELEASE_TE` 判据只看变量存在不看值，服务模式下 TE 照样被释放。
+  现在能用的形态是 `python tools/webui.py` + chain 模式（256² 57.6 s 往返、512² 158.3 s）。
+  详见 `docs/npu-split.md §22`。
 - **rope 的两次 `CONT` 约占 DSP 10%**（去交织/还原，各 ~2 ms / 4.3 MB）。原生内核只支持
   半切配对（MROPE），而去交织在 ggml 里只能靠 `cont(permute)`，删不掉。
 - `--steps` 会被 `--sigmas <preset>` 覆盖（Turbo 的 preset 写死 8 步）。
