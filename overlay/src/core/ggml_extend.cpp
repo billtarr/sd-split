@@ -1005,6 +1005,12 @@ ggml_tensor* ggml_ext_rope_apply(GGMLRunnerContext* runner_ctx,
                              (int) rot_dim, runner_ctx->rope_sections, GGML_ROPE_TYPE_MROPE,
                              0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
 
+        // 交织还原：[偶数位|奇数位] -> 原始的相邻对顺序。q/k 用同一个排列时注意力分数不变，
+        // 但保持和 pe 路径完全一致的布局更安全（下游还有 out_proj 之前的 reshape）。
+        x4 = ggml_reshape_4d(ctx, x4, d_head / 2, 2, n_head, L);       // [pair, lane, n_head, L]
+        x4 = ggml_cont(ctx, ggml_permute(ctx, x4, 1, 0, 2, 3));        // [lane, pair, n_head, L]
+        x4 = ggml_reshape_3d(ctx, x4, d_head, n_head, L);              // 回到交织
+
         x4 = ggml_cont(ctx, ggml_permute(ctx, x4, 0, 2, 1, 3));        // [d, L, n_head]
         return ggml_reshape_3d(ctx, x4, d_head, L, n_head);
     }

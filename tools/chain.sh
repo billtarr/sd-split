@@ -37,9 +37,14 @@ export SD_DIT_CTX_FILE="${SD_DIT_CTX_FILE:-/data/local/tmp/qisplit/qs-split-ctx.
 # TE（Qwen3-VL-8B Q4_K_M，4.4 GB）编码完就释放：末段 RSS 4.48 GB -> 24 MB，代价约 +6 s。
 # 只在「一次性跑」下安全（同进程不会再编码新 prompt）；常驻服务模式必须关掉。
 export SD_DIT_RELEASE_TE="${SD_DIT_RELEASE_TE:-1}"
-# 原生 M-RoPE 内核：速度 3×（1.83 s/it vs 5.11），但数值还没和 pe 路径对齐（出图 MAE 66.9/255），
-# 所以默认关闭。要试验：SD_ROPE_NATIVE=1。
-export SD_ROPE_NATIVE="${SD_ROPE_NATIVE:-0}"
+# 原生 M-RoPE 内核：采样 5.07 -> 1.96 s/it，出图与 pe 路径 MAE 0.45/255（PSNR 48.9 dB）。默认开。
+# 回退到通用的「转置+repeat+mul」分解：SD_ROPE_NATIVE=0
+export SD_ROPE_NATIVE="${SD_ROPE_NATIVE:-1}"
+# VAE 的卷积走哪条路。默认 "auto,vae=on" = 强制 VAE 用 HTP 原生 CONV_2D。
+# 原因：sd.cpp 的 auto 要求后端有 implicit GEMM，HTP0 上一律判 off → conv 退化成 IM2COL，
+# 而 im2col 产物在 256² 就有 324 MB，被尺寸门槛拒掉后整段回退 CPU（图被切成 31 段 HTP0/CPU 交替）。
+# 实测 VAE 解码 17.43 s → 1.55 s（11×），出图 MAE 0.57/255。回退：CONV_DIRECT=auto
+CONV_DIRECT="${CONV_DIRECT:-auto,vae=on}"
 
 [ -n "$SD_DIT_DUMP_DIR" ] && mkdir -p "$SD_DIT_DUMP_DIR"
 
@@ -50,6 +55,7 @@ export SD_ROPE_NATIVE="${SD_ROPE_NATIVE:-0}"
   -p "$PROMPT" --sigmas qwen-image-2.1-turbo --steps "$STEPS" --cfg-scale 1.0 --seed "$SEED" \
   -H "$H" -W "$W" ${THREADS:+-t "$THREADS"} \
   --backend "diffusion=HTP0,vae=$VAE_BACKEND,te=CPU" \
+  ${CONV_DIRECT:+--conv-direct "$CONV_DIRECT"} \
   -o "out_$TAG.png"
 
 echo "CHAIN exit=$?"

@@ -13,16 +13,22 @@ v73 每个 fastrpc PD 只有 **2304 MB** 的 IOVA 窗口，装不下 3.91 GiB �
 |---|---|---|---|---|
 | CPU 单进程 | 48.5 s/it | 58 s（CPU） | 437 s | 基线 |
 | NPU 单进程 + 权重流式（已移除） | 7.73 s/it | 58 s（CPU） | 133.8 s | `39595a07…` |
-| **NPU 三段 + VAE 上 NPU** | **5.05 s/it** | **19.2 s** | **85.1 s** | `1ceb0cc0…` |
+| NPU 三段 + VAE 上 NPU | 5.05 s/it | 19.2 s | 85.1 s | `1ceb0cc0…` |
 | 上面再加 TE 用完即释放 | 5.10 s/it | 17.8 s | 91.7~96.6 s | `1ceb0cc0…` |
+| **当前默认（+ 原生 M-RoPE + VAE conv-direct）** | **1.92 s/it** | **1.55 s** | **53.19 s** | MAE 0.45/255 vs 上表 |
 
 - 三段相对整模型：采样 **−34%**。全程 `mapped 1450 MiB` 常驻、**权重零搬运**——每段一次 map 到底，
   不做任何换入换出（流式代码已整体移除，见「已知限制」）。
-- VAE 上 NPU：58 s → 19 s（**−67%**），与 CPU 结果比 `MAE 0.030/255`、`PSNR 63.2 dB`。
+- **原生 M-RoPE**（`SD_ROPE_NATIVE`，默认开）：替掉「转置 + repeat + mul」的退化分解
+  （内层维只有 2，HVX 无法向量化），采样 **5.07 → 1.92 s/it**。与旧路径 MAE 0.45/255。
+- **VAE conv-direct**（`CONV_DIRECT=auto,vae=on`，默认开）：sd.cpp 的 auto 探测要求后端有
+  implicit GEMM，HTP0 一律判 off → 卷积退化成 im2col（256² 产物 324 MB）被尺寸门槛拒掉、
+  整段回退 CPU，图被切成 31 段交替。强制走 HTP 原生 `CONV_2D` 后解码 **17.43 → 1.55 s**。
 - TE 用完即释放：末段 RSS **4.48 GB → 24 MB**，代价 +7~13% 时间。
-- 512² / 8 步：**437.7 s**（采样 8×32.0 s、VAE 152 s）。全程零搬运，慢是 token 数（265 → 4105）。
+- 512² / 8 步（默认参数）：**253.40 s**（采样 8×17.80 s、VAE 80.15 s；此前 437.7~492.8 s）。
 
 数值判据：分段结果与整模型**逐位相同**（`vel` 8/8 步 `max|d| = 0`，出图 md5 一致）。
+两条新增快路的判据用 MAE/PSNR（换 kernel 后浮点尾数会变，md5 不再逐位一致）。
 
 ## 快速开始
 
@@ -100,7 +106,12 @@ ref/                libggml-htp-v73.so（DSP applet）、libcdsprpc.so（ABI 常
 - **权重流式已彻底移除**（`relinquish/restore`、`MAPBUDGET`、`RPCMEM_FREE` 全部删除）。
   它能把 3.9 GiB 塞进 2304 MB 窗口，但 256² 每步要搬 6.9 GB、8 步共 54.9 GiB；分段之后完全不需要。
   代价：**单进程跑整模型这条路没有了**——权重 > 2304 MB 会直接 map 失败，必须走分段。
-- **512² 的 VAE 152 s**（占端到端 35%）：疑似中间层激活超 VTCM（8 MB）落 DDR，未深挖。
+- ~~512² 的 VAE 152 s~~ → 已解决（conv-direct，152 → 80 s，见 `docs/npu-split.md §19`）。
+- **f32 注意力是现在的头号瓶颈**：`MUL_MAT f32 128x256x32`（QK^T）只有 35 GFLOPS，
+  加上 SOFT_MAX / PV 约占 DSP 时间的 31%。HTP 有 `htp/flash-attn-ops.h`，但 sd.cpp 的
+  `sd_probe_flash_attention()` 没有为 HTP0 开过。
+- **rope 的两次 `CONT` 约占 DSP 10%**（去交织/还原，各 ~2 ms / 4.3 MB）。原生内核只支持
+  半切配对（MROPE），而去交织在 ggml 里只能靠 `cont(permute)`，删不掉。
 - `--steps` 会被 `--sigmas <preset>` 覆盖（Turbo 的 preset 写死 8 步）。
 - 没有 root、没有 udmabuf，VAE 只能走 CPU 或 HTP（本仓库只有这两个后端编进来）。
 

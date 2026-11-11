@@ -904,3 +904,120 @@ VAE 解码 wall **17.8 s**，但 DSP 只忙 **3.83 s**。用 `GGML_SCHED_DEBUG=2
 
 ---
 
+---
+
+## 19. VAE 掉 CPU 已修好：`--conv-direct auto,vae=on`（2026-11-11）
+
+### 19.1 根因链
+
+| 环节 | 事实 |
+|---|---|
+| sd.cpp 的 auto 探测 | `src/core/probe/conv_direct.cpp:88` 只在 `sd_backend_supports_conv_implicit_gemm()` 为真时才开 direct |
+| HTP0 | 没有 implicit GEMM → 日志固定打 `conv2d direct auto: HTP0 -> off (no implicit GEMM path)` |
+| 于是 conv2d 走 im2col | `IM2COL` + `MUL_MAT` 一对，im2col 产物 256² 就有 **324 MB**（162 MB 的也过不去） |
+| HTP 的尺寸门槛 | `htp_kparams_solve_im2col()` 的 `owb` 循环到 1 仍不满足 VTCM 约束 → `return false` → 节点落 CPU |
+| 图被切碎 | sched 把 VAE 图切成 **31 段 HTP0/CPU 交替**，每段边界搬 36~72 MB 激活 |
+
+对账：VAE 的 DSP 时间只有 3.83 s，wall 17.8 s，差额 14 s 就是这些 CPU 段 + 边界拷贝。
+
+### 19.2 修法
+
+HTP 后端本来就有原生 `CONV_2D`（宿主 `htp_kparams_solve_conv2d`，DSP `htp/conv2d-ops.h`），
+只是 auto 探测够不到。强制开：
+
+```sh
+--conv-direct auto,vae=on
+```
+
+`tools/chain.sh` 已设为默认（`CONV_DIRECT`，回退用 `CONV_DIRECT=auto`）。
+
+### 19.3 实测
+
+| | im2col（回退 CPU） | conv-direct（原生 CONV_2D） |
+|---|---|---|
+| 256² `decode_first_stage` | 17.43 s | **1.55 s** |
+| 512² `decode_first_stage` | 152 s | **79.40 s** |
+| 出图 vs 原路径 | — | **MAE 0.567/255 / PSNR 46.96 dB** |
+
+512² 端到端 **323.65 s**（此前 437.7~492.8 s），采样 28.43 s/it。
+
+统计佐证（末段）：`CONV_2D` 只占 DSP 的 5.6%、`PAD` 2.0%，**再没有 CPU 段**。
+
+> 注意 `PAD`：VAE 里有 circular padding，走的是单独的 PAD 算子（2.0%），
+> 不是 conv 的 p0/p1 参数。
+
+---
+
+## 20. 原生 M-RoPE 数值修好了（2026-11-11）
+
+### 20.1 真正的 bug：悬垂指针，不是数学
+
+`I-039` 那次「快 3× 但出图是灰纹理」跟 sections / freq_factors / pairing 都没关系。
+`GGMLRunner::set_backend_tensor_data()` 只记录指针：
+
+```cpp
+void GGMLRunner::set_backend_tensor_data(ggml_tensor* tensor, const void* data) {
+    ggml_set_input(tensor);
+    backend_tensor_data_map[tensor] = data;   // ← 只是存指针
+}
+```
+
+真正的 `tensor_set` 发生在图分配之后。而 `make_input(sd::Tensor(...))` 传的是右值，
+**那个 Tensor 在语句结束就析构了**，于是 positions / freq_factors 全是已释放内存。
+
+后果正好是「rope 退化成恒等」（positions 全 0 → theta=0 → cos=1, sin=0），
+和当时「灰纹理、位置信息没生效」的现象一致。
+
+### 20.2 两处修改
+
+```cpp
+// qwen_image_2_1.hpp：保活到 compute 结束
+sd::Tensor<int32_t> rope_pos_holder;
+sd::Tensor<float>   rope_ff_holder;
+...
+rope_pos_holder = sd::Tensor<int32_t>({4 * n_tok}, std::move(pos));
+rope_ff_holder  = sd::Tensor<float>({n_pair}, std::move(ff));
+ctx.rope_positions    = make_input(rope_pos_holder);
+ctx.rope_freq_factors = make_input(rope_ff_holder);
+```
+
+```cpp
+// ggml_extend.cpp：rope 之后补上「交织还原」
+x4 = ggml_reshape_4d(ctx, x4, d_head / 2, 2, n_head, L);   // [pair, lane, n_head, L]
+x4 = ggml_cont(ctx, ggml_permute(ctx, x4, 1, 0, 2, 3));    // [lane, pair, n_head, L]
+x4 = ggml_reshape_3d(ctx, x4, d_head, n_head, L);          // 回到交织
+```
+
+交织还原严格说不是必需的（q/k 用同一排列，注意力分数不变），
+但保持和 pe 路径完全一致的布局更安全，代价只有一次 4.3 MB 的 cont。
+
+### 20.3 实测（默认参数，256²/8 步 seed42）
+
+| | pe 路径 | 原生 M-RoPE |
+|---|---|---|
+| 采样 | 5.07 s/it | **1.92 s/it** |
+| 端到端 | 93.96 s | **53.19 s** |
+| 出图 | 基准 | **MAE 0.447/255、PSNR 48.94 dB** |
+
+回退开关：`SD_ROPE_NATIVE=0`。
+
+### 20.4 修好后的算子分布（末段，DSP 5.17 s / 6854 op）
+
+| 类 | 占比 | 备注 |
+|---|---|---|
+| `MUL_MAT`（含注意力） | 50.5% | 其中 **`f32 128x256x32`（QK^T）24.4%，只有 35.4 GFLOPS** |
+| `CONT` | **18%** | 约 10% 是 rope 的去交织/还原（每次 ~2 ms / 4.3 MB） |
+| `CONV_2D`（VAE） | 5.6% | 已经全在 HTP 上 |
+| `MUL_MAT_NX` | 4.2% | q4_K 3312 GFLOPS |
+| `SOFT_MAX` | 3.7% | |
+| `SWIGLU` / `SCALE` / `PAD` | 3.0 / 2.9 / 2.0% | |
+| **`ROPE`** | **0.8%** | 原来是 65.9% |
+
+量化矩阵乘仍然健康：q4_K `24576x265` 7549 GFLOPS、`4096x265` 5680 GFLOPS。
+
+**下一个瓶颈是 f32 注意力**（QK^T 35 GFLOPS + SOFT_MAX + PV ≈ 31%）。
+HTP 有 `htp/flash-attn-ops.h`，但 sd.cpp 的 `sd_probe_flash_attention()` 对 HTP0 没有判过，
+所以现在走的是 f32 的 mul_mat + soft_max 三段式。
+
+---
+

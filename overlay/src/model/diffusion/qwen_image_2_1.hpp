@@ -1032,6 +1032,11 @@ namespace Qwen {
                     checked_cache.flash_attn_used = &flash_attn_used;
                 }
                 const bool cached = active_cache.mode == QwenImage21PrefixCache::Mode::REUSE;
+                // 原生 M-RoPE 的输入张量必须活到 compute 结束：make_input 只登记
+                // backend_tensor_data_map[ptr->data]，真正拷贝发生在图分配之后。
+                // 传临时 Tensor 会留下悬垂指针（positions 变成垃圾 → rope 退化成恒等变换）。
+                sd::Tensor<int32_t> rope_pos_holder;
+                sd::Tensor<float>   rope_ff_holder;
                 mask_data.clear();
                 if (!cached) {
                     for (const auto& segment : layout.segments) {
@@ -1088,11 +1093,12 @@ namespace Qwen {
                     // ggml_ext_rope_apply() 看到它们就走 HTP 的原生 rope 内核（见 ggml_extend.cpp）。
                     // 关掉：SD_ROPE_NATIVE=0（回退到通用的「转置+repeat+mul」分解）。
                     {
-                        // 默认关闭：速度是 3×（1.83 s/it vs 5.11），但数值与 pe 路径不一致
-                        // （出图 MAE 66.9/255），语义还没对齐。开着试：SD_ROPE_NATIVE=1。
+                        // 默认开启：原生 M-RoPE 内核比「转置+repeat+mul」的通用分解快 3×
+                        // （5.07 -> 1.96 s/it），出图与 pe 路径 MAE 0.45/255（PSNR 48.9 dB）。
+                        // 关掉：SD_ROPE_NATIVE=0。
                         static const bool rope_native = []() {
                             const char* e = getenv("SD_ROPE_NATIVE");
-                            return e != nullptr && atoi(e) != 0;
+                            return e == nullptr || atoi(e) != 0;
                         }();
                         if (rope_native && !cached && !layout.positions.empty()) {
                             const int64_t n_tok  = (int64_t) layout.positions.size();
@@ -1120,8 +1126,10 @@ namespace Qwen {
                                     off += dim_a / 2;
                                 }
                                 // ggml 要求 positions 是 1D：长度 4*n_tok，4 个轴各占一段（见 htp/rope-ops.c）
-                                ctx.rope_positions    = make_input(sd::Tensor<int32_t>({4 * n_tok}, std::move(pos)));
-                                ctx.rope_freq_factors = make_input(sd::Tensor<float>({(int64_t) n_pair}, std::move(ff)));
+                                rope_pos_holder = sd::Tensor<int32_t>({4 * n_tok}, std::move(pos));
+                                rope_ff_holder  = sd::Tensor<float>({n_pair}, std::move(ff));
+                                ctx.rope_positions    = make_input(rope_pos_holder);
+                                ctx.rope_freq_factors = make_input(rope_ff_holder);
                                 for (int a = 0; a < 3; ++a) {
                                     ctx.rope_sections[a] = config.axes_dim[(size_t) a] / 2;
                                 }
