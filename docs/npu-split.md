@@ -1157,7 +1157,7 @@ TE 是 Qwen3-VL-8B Q4_K_M 跑在 CPU 上，抖动来自设备后台负载和热�
 
 ---
 
-## 22. 常驻分段服务（serve.sh）当前不可用（2026-11-11）
+## 22. 常驻分段服务（serve.sh）曾经不可用（2026-11-11，已修，见 §23）
 
 ### 22.1 现象
 
@@ -1215,7 +1215,55 @@ if (getenv("SD_DIT_RELEASE_TE") != nullptr && sd->cond_stage_model) { ... }
 1. `examples/server/main.cpp`：`SD_DIT_SPLIT_WORKER=1` 时不启 HTTP，直接跑一次生成以进入握手；
 2. `image.cpp`：TE 释放判据改 `atoi(...) != 0`。
 
-两处都还没动。
+两处都已修，见 §23。
 
 ---
 
+---
+
+## 23. 常驻分段服务修好：worker 分流 + timestep 随 latent 下发（2026-11-11）
+
+### 23.1 改了什么
+
+| 位置 | 改动 |
+|---|---|
+| `examples/server/main.cpp` | `new_sd_ctx` 之后、起 HTTP 之前判 `SD_DIT_SPLIT_WORKER`（`atoi != 0`）→ 不进 `initialize_server_models`、不 `svr.listen`，直接 `sd_serve_split_worker()` |
+| `include/stable-diffusion.h` + `src/stable-diffusion.cpp` | 新 C API `sd_serve_split_worker(sd_ctx_t*)` |
+| `src/model/diffusion/model.hpp` | `DiffusionModelRunner` 加两个虚函数：`serve_split_worker(int)`（默认 false）、`reset_split_state()`（默认空） |
+| `qwen_image_2_1.hpp` | 实现 worker 驱动循环；段间帧加第三个头字段 `timestep`；worker 用它代替自己的 `inputs.timesteps` |
+| `diffusion_engine.cpp` | `end_runners()` 末尾调 `reset_split_state()`；`serve_split_worker()` 转发给 runner；`sd_split_worker_mode()` 判据改 `atoi(...) != 0` |
+| `image.cpp` | `SD_DIT_RELEASE_TE` 判据改 `atoi(...) != 0` |
+
+### 23.2 为什么必须让 timestep 跟着帧走
+
+worker **没有采样器**（不跑 `sample()`），而 `t` 要进 DiT 的 modulation（`model.forward(..., timestep, ...)`）。
+以前 CLI 模式下各进程跑同一份调度、各算各的 `t`，是隐含前提；worker 循环化以后这个前提没了，
+所以帧格式从 `step | ndim | dims | data` 变成 `step | ndim | ts_bits | dims | data`
+（`ts_bits` 是 float 的位模式；NaN = 不知道，退回调用方的）。
+
+副作用（好东西）：worker 与**分辨率、步数、prompt 完全解耦**，同一个常驻链可以直接换尺寸/换步数。
+
+### 23.3 每请求重发 ctx
+
+`reset_split_state()` 在末段（`!split_worker_ && split_prev_fd_ >= 0`）把 `split_ctx_sent_` 清 0，
+于是每个请求的第一步会重新发 `(-1, ctx)`。worker 收到就替换 `split_ctx_hold_`，不用重读文件。
+
+### 23.4 实测（v73，256²/8 步，seed 42，HTTP `/sdapi/v1/txt2img`）
+
+| 请求 | 耗时 | 备注 |
+|---|---|---|
+| 第 1 次 `a cat` | **87.8 s** | 含 spawn 两个 worker + 各段加载模型 |
+| 第 2 次 `a red apple on a table` | **45.7 s** | worker 在位，ctx 重发 `[4096, 14]` |
+| 第 3 次 `a lighthouse at sunset` 320×192 | **43.0 s** | 换分辨率，未重启 |
+| 对照 `chain.sh` 一次性跑 | 77.3 s | 每请求重付加载 |
+
+进程状态（`ps -A | grep sd-server`）：
+
+```
+17604  tail  RSS 4.4G  inet_accept              ← 末段 = HTTP 服务
+17973  [11,22) RSS 66M unix_stream_data_wait    ← 常驻 worker
+18030  [0,11)  RSS 66M unix_stream_data_wait    ← 常驻 worker
+```
+
+日志特征：`split worker mode: layers [11, 22), no HTTP listener`、`split worker serving layers ...`；
+**没有** `conditioner released`（TE 保留），三张图内容都对（猫 / 红苹果 / 灯塔）。
