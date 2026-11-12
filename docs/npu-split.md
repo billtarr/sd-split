@@ -1549,8 +1549,9 @@ auto apply = [&](ggml_tensor* part, ggml_tensor* row) {
 | 4 | a red apple on a table | **448²** | 200 / 140.0 s |
 | 5 | a lighthouse on a cliff at sunset | **512²** | 200 / 240.4 s |
 
-五张图内容都正确（512² 也没出现之前担心的 FA 数值漂移）。**崩溃不可稳定复现**，
-所以没有改逻辑 —— 盲改调制那两行只会把「崩溃」变成「静默算错图」，更糟。
+五张图内容都正确（512² 也没出现之前担心的 FA 数值漂移）。当时结论是「崩溃不可稳定复现，
+所以不改逻辑」——**这个结论在 §27.6 被推翻了**：不是不可复现，是我一直走 curl（cfg=1.0），
+没有走 WebUI 那条（cfg=6.0）路径。保留这段是为了记住「换条请求路径再试」。
 
 ### 27.3 埋了只在即将崩溃时触发的诊断
 
@@ -1580,9 +1581,49 @@ if (!ggml_can_repeat(row, part)) {
 attention 的二次项。数值这次是干净的，但 `SD_FLASH_ATTN_MAX_KV=0` 下 HMX 仍属「可能漂」，
 出图前建议先用 20 步确认一次。
 
-### 27.6 遗留
+### 27.6 ★ 根因找到了：WebUI 把 `cfg_scale` 写死成 6.0
+
+用户补充了关键信息「手动在 WebUI 点生成，**10 多秒后**崩溃」。19 秒这个量级正好是
+TE 编码（~9 s）+ 首步建图，于是去翻 WebUI 的请求体：
+
+```js
+body: JSON.stringify({
+  prompt, steps, width: size, height: size,
+  cfg_scale: 6.0,          // ← 这里
+  sampler_name: 'euler', seed: -1,
+})
+```
+
+**Qwen-Image Turbo 是 8 步蒸馏模型，cfg 只能是 1.0。** `cfg_scale > 1` 会让 sd.cpp 启用
+uncond 分支，把 cond/uncond 拼成 **batch=2** 一起跑；而分段链的 timestep 下发是单路的
+（末段发一个 float，worker 用 `from_vector({ts})` 造出 `ne[1]=1` 的 tensor），
+2 个 batch 的 latent 配 1 个 timestep → `modulation` 的 batch 维对不上 →
+建图时 `GGML_ASSERT(ggml_can_repeat(b, a))` 直接 SIGABRT。
+
+对照实验（同一进程、同一 prompt、只改 cfg）：
+
+| cfg_scale | 结果 |
+|---|---|
+| 1.0 | **200 / 77.1 s**，出图正确 |
+| 6.0 | **502 / 19.3 s，三个进程全死** |
+
+这也解释了为什么之前用 curl 测了五个请求一次都没复现 —— 那些全是 `cfg_scale: 1.0`；
+只有从 WebUI 点按钮才会带上 6.0。**「不可复现」其实是「没走同一条请求路径」。**
+
+修复：
+
+1. WebUI 的 `cfg_scale` 改为 `cfgScale` 变量，值由网关 `/health` 下发（读实例参数，
+   不再写死）。网关 `health()` 新增 `cfg_scale` / `size` / `steps` 三个字段。
+2. 尺寸下拉（含 640²/768²，768² 必 OOM）改成 **number input + datalist**，
+   预设 320/512，可自由输入，前端校验 16 的倍数、64~1024。
+3. 文案纠正：原文写「NPU 跑 DiT 的 QNN 分段链，**文本编码与解码在 CPU**」——
+   解码（VAE）早就挪到 HTP 上了，现在只有文本编码在 CPU。
+
+实测：WebUI 点生成 → **完成 79.6 s（8 步 320²）**，出图正确，进程全程存活。
+
+### 27.7 遗留
 
 - **分辨率有两处设置会打架**：卡片上的「分辨率」决定进程启动的 `-W/-H`；WebUI 页面里的
   「尺寸」下拉是请求级参数。两者不一致时以请求为准，用户容易困惑，后续应让 WebUI 读
   `/health` 里的 `sizes` 并默认跟随卡片。
-- 崩溃根因未定位（诊断已就位，等下次复现）。
+- ~~崩溃根因未定位~~ → 已定位（§27.6），诊断代码保留：以后再出现 `!ggml_can_repeat` 会直接打印 shape。
