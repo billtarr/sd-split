@@ -1760,6 +1760,20 @@ VAE 是估算（按 decoder 各分辨率级的参数占比 55/20/15/10 加权）
 
 （TE 的 0.21 TF 没计入：相对 DiT 可以忽略。）
 
+#### App 内实测（14:05，常驻服务形态）
+
+`am broadcast -a dev.pocketmodel.studio.CMD --es cmd start --es model qwen-image-2.1-turbo-split`
+起的服务（`libsd_server.so` 走 nativeLibraryDir，参数与 manifest 一致），同一 prompt / seed42：
+
+| 尺寸 | DiT | VAE | generate | HTTP 往返 |
+|---|---|---|---|---|
+| 320² | 2.13 s/it | 2.67 s | 37.16 s | **37.4 s** |
+| 512² | 5.43 s/it | 6.89 s | 56.50 s | **56.9 s** |
+
+比 `chain.sh` 还快 15~25 s（512²：56.5 vs 71.3）—— 常驻 worker 不用重新拉起、TE 与页缓存全热。
+这两行才是用户实际感知的数字。
+
+
 
 
 ### 29.5 ★★ 3.1~3.3 倍回退：根因是原生 M-RoPE 建图块被误删（11-12 14:00 定位并修好）
