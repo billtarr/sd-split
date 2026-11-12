@@ -90,14 +90,77 @@ class Reader:
         raise ValueError(f"未知字段类型 {t}")
 
 
+def flops_report(r, tokens, s_its):
+    """按张量形状算每步 FLOPs（DiT 的 matmul 都是线性层，所以能算准）。
+
+    关键点：**每 token 参数量 ≠ 总参数量**。`modulation` / `time_text_embed` 是「从 timestep
+    生成调制向量」，每步只算一次，不随 token 数放大；把它们乘进 token 数会高估 1~2%。
+    attention 那一项单独算：QK^T 与 AV 各 T²·d 个 MAC（d = hidden）。
+    """
+    per_token = once = norm = head = 0
+    heads = layers = 0
+    d = 0
+    for t in r.tensors:
+        name = t["name"]
+        n = 1
+        for x in t["dims"]:
+            n *= x
+        if "modulation" in name or "timestep_embedder" in name:
+            once += n
+        elif any(k in name for k in (".attn.to_q.", ".attn.to_k.", ".attn.to_v.",
+                                     ".attn.to_out.")):
+            per_token += n
+            if ".attn.to_q." in name:
+                layers += 1
+                d = t["dims"][0]
+        elif ".mlp." in name or ".img_mlp." in name or ".ffn." in name:
+            per_token += n
+        elif name.endswith(("norm_out.linear.weight", "proj_out.weight", "img_in.weight")):
+            per_token += n
+            head += n
+        else:
+            norm += n
+
+    total = sum(t["bytes"] for t in r.tensors)
+    nparam = 0
+    for t in r.tensors:
+        ne = 1
+        for x in t["dims"]:
+            ne *= x
+        nparam += ne
+
+    print(f"总参数 {nparam/1e9:.4f} G   权重 {total/2**30:.3f} GiB   "
+          f"折合 {total*8/nparam:.2f} bit/参数")
+    print(f"每 token 参与乘加 {per_token/1e9:.4f} G   每步一次 {once/1e9:.4f} G   "
+          f"norm/scale {norm/1e6:.1f} M   head {head/1e6:.1f} M")
+    print(f"hidden d={d}  layers={layers}")
+
+    print(f"\n{'token':>7} {'线性(TF)':>10} {'attn(TF)':>10} {'每步(TF)':>10} "
+          f"{'8步(TF)':>9} {'s/it':>7} {'TFLOPS':>8}")
+    for tok, s_it in zip(tokens, s_its):
+        lin = 2 * per_token * tok
+        att = 4 * tok * tok * d * layers
+        per = lin + att + 2 * once
+        print(f"{tok:>7} {lin/1e12:>10.2f} {att/1e12:>10.2f} {per/1e12:>10.2f} "
+              f"{per*8/1e12:>9.1f} {s_it:>7.2f} {per/1e12/s_it:>8.2f}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("gguf")
     ap.add_argument("--tensors", action="store_true", help="列出每个 tensor")
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--flops", action="store_true",
+                    help="按张量形状算每步 FLOPs 与有效算力（默认 Qwen-Image 三档）")
+    ap.add_argument("--tokens", default="1034,1610,4106", help="图像 token 数，逗号分隔")
+    ap.add_argument("--s-it", dest="s_it", default="1.46,2.18,5.32", help="对应实测 s/it")
     a = ap.parse_args()
 
     r = Reader(a.gguf)
+    if a.flops:
+        flops_report(r, [int(x) for x in a.tokens.split(",")],
+                     [float(x) for x in a.s_it.split(",")])
+        return
     total = sum(t["bytes"] for t in r.tensors)
     per_layer = collections.defaultdict(int)
     n_layer = 0
