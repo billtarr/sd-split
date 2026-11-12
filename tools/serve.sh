@@ -35,6 +35,12 @@ export SD_ROPE_NATIVE="${SD_ROPE_NATIVE:-1}"
 #    想稳妥就设 SD_FLASH_ATTN_MAX_KV=1024（默认值，512² 自动退回 f32 三段式）。
 export SD_FLASH_ATTN_MAX_KV="${SD_FLASH_ATTN_MAX_KV-0}"
 
+# VAE 分块解码（与 chain.sh 同源，见 I-049）：512² 的最后一档 conv（512×512 输出）
+# kparams 在 VTCM 约束下求解失败 → 整档落 CPU，VAE 解码 78.5 s；切成 320 tile 后进 DSP，6.8 s。
+# 320² 单 tile 走同一路径，只多 0.23 s，所以默认全尺寸开。
+# 关掉：VAE_TILING=  sh serve.sh
+VAE_TILING="${VAE_TILING---vae-tiling --vae-tile-size 320}"
+
 # CPU 拓扑（v73）：cpu0-2 = A510 2.0 GHz，cpu3-6 = A715 2.8 GHz，cpu7 = X3 3.19 GHz。
 # TE（Qwen3-VL-8B Q4_K_M）在 CPU 上只做 10~16 token 的 GEMV，本质是「把 4.8 GB 权重扫一遍」，
 # 8 线程时 3 个小核各领一份行、成为同步瓶颈（实测编码时 cpu0 1.67 / cpu4 1.92 / cpu7 1.6 GHz，
@@ -48,7 +54,9 @@ set -- --diffusion-model models/dit.gguf \
     --backend "diffusion=HTP0,vae=HTP0,te=CPU" \
     --conv-direct "auto,vae=on" \
     --flash-attn "off,diffusion=on" \
+    ${VAE_TILING:+$VAE_TILING} \
     --listen-ip "${LISTEN_IP:-0.0.0.0}" --listen-port "$PORT"
+
 # 默认值：5 线程 + cpu3~7（4 个 A715 + X3）。实测（v73，256²/8 步）：
 #   默认 8 线程/不绑核：预热 27.8 s、TE 4.6 s、sampling 39.4 s
 #   f8 + 5 线程      ：预热 12.6 s、TE 4.2 s、sampling 37.6 s   ← 定版

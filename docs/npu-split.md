@@ -1821,9 +1821,28 @@ sd.cpp 自带空间分块解码（默认 tile 256）。切成 320 的 tile 后**
 | 位置 | 改动 |
 |---|---|
 | `tools/chain.sh` | 新增 `VAE_TILING="${VAE_TILING---vae-tiling --vae-tile-size 320}"`，关掉用 `VAE_TILING=` |
+| `tools/serve.sh` | 同上（11-12 补，见 §30.7；此前漏了，常驻服务路径一直是「conv-direct 开、tiling 关」） |
 | `manifest.entry.args` | 追加 `--vae-tiling --vae-tile-size 320` |
+| `dist/*.mlm` | 需重新打包才带上（11-12 已重打） |
 
 不需要重编二进制（sd.cpp 早就支持这组参数）。
+
+### 30.7 11-12 复核：三条路径逐条落地
+
+改完要确认**不是只改了 chain.sh**。逐条核对结果：
+
+| 路径 | 核对方式 | 结果 |
+|---|---|---|
+| `chain.sh` | 设备实跑 512²，日志 `decode_first_stage` | **7.57 s** ✓（端到端 198.8 s，DiT 17.5 s/it） |
+| `serve.sh`（常驻 / App 等价配置） | `ps` 看 cmdline + 实跑 512² | cmdline 含 `--vae-tiling --vae-tile-size 320`，解码 **7.84 s** ✓ |
+| 320² 默认档 | `chain.sh` 实跑 | **2.33 s**（改前 1.93，+0.4 s）✓ 无回退 |
+| App manifest | 设备 `files/models/…/manifest.json` md5 | 与 `build/qwen-image-split/manifest.json` 同为 `590eeb03…` ✓ |
+| App 二进制 | 已安装 `libsd_server.so` md5 vs `jniLibs` | 同为 `5d92c225…`，`grep -a -- "--vae-tile-size"` 命中 2 次 ✓ |
+| 参数透传 | `ArgsBuilder.build()` | 无占位符的字面量原样下发；sdapi 路由 `gen_params = *default_gen_params` 继承 CLI 默认 ✓ |
+| `dist/*.mlm` | 解包看 `manifest.json` | **原包是 02:09 打的，还是 `--steps {steps}` 的旧版**（缺 tiling、占位符会解析成空串直接把参数解析打崩）→ 已重打 |
+
+★ 教训：**参数类改动要同时数「有几条入口」**。`--vae-tiling` 这类纯 CLI 开关没有编译期保护，
+chain / serve / manifest / .mlm 四个地方各写一遍，漏一个不会有任何报错，只是慢 12 倍。
 
 ### 30.5 实测（App 内，v73）
 
