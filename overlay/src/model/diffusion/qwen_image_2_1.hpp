@@ -1107,6 +1107,11 @@ namespace Qwen {
                     checked_cache.flash_attn_used = &flash_attn_used;
                 }
                 const bool cached = active_cache.mode == QwenImage21PrefixCache::Mode::REUSE;
+                // 原生 M-RoPE 的输入张量必须活到 compute 结束：make_input 只登记
+                // backend_tensor_data_map[ptr->data]，真正拷贝发生在图分配之后。
+                // 传临时 Tensor 会留下悬垂指针（positions 变成垃圾 → rope 退化成恒等变换）。
+                sd::Tensor<int32_t> rope_pos_holder;
+                sd::Tensor<float>   rope_ff_holder;
                 mask_data.clear();
                 if (!cached) {
                     for (const auto& segment : layout.segments) {
@@ -1159,6 +1164,55 @@ namespace Qwen {
                         }
                     }
                     auto ctx = get_context(graph);
+                    // 原生 M-RoPE：建图前把 positions + 逐对频率修正挂到 runner ctx 上，
+                    // ggml_ext_rope_apply() 看到它们就走 HTP 的原生 rope 内核（见 ggml_extend.cpp）。
+                    // 关掉：SD_ROPE_NATIVE=0（回退到通用的「转置+repeat+mul」分解）。
+                    //
+                    // ★ 11-12 13:5x 补回：这段在 `8070048`（sd-server 当末段 / timestep 随 latent 下发）
+                    // 重构时被整块删掉了，没人注意 —— 后果是 rope_positions 永远 nullptr，
+                    // 原生内核成了死代码，rope 一律走通用分解（单个 REPEAT 19 ms，占采样 53%），
+                    // 每步 1.45 → 4.52 s/it（3.1×）。chain.sh 里 SD_ROPE_NATIVE=1 也就变成了空开关。
+                    {
+                        static const bool rope_native = []() {
+                            const char* e = getenv("SD_ROPE_NATIVE");
+                            return e == nullptr || atoi(e) != 0;
+                        }();
+                        if (rope_native && !cached && !layout.positions.empty()) {
+                            const int64_t n_tok  = (int64_t) layout.positions.size();
+                            const int64_t n_pair = config.head_dim / 2;
+                            if ((int64_t) config.axes_dim.size() == 3 &&
+                                config.axes_dim[0] / 2 + config.axes_dim[1] / 2 + config.axes_dim[2] / 2 == n_pair) {
+                                std::vector<int32_t> pos((size_t) (4 * n_tok), 0);
+                                for (int a = 0; a < 3; ++a) {
+                                    for (int64_t i = 0; i < n_tok; ++i) {
+                                        pos[(size_t) (a * n_tok + i)] = (int32_t) layout.positions[(size_t) i][(size_t) a];
+                                    }
+                                }
+                                // HTP/ggml 的 theta 指数用全局 n_dims，sd.cpp 的 pe 用逐轴 axes_dim；
+                                // ff[k] = 10000^(2*k_local/dim_axis - 2*k/head_dim) 把两者对齐。
+                                std::vector<float> ff((size_t) n_pair, 1.0f);
+                                int                off = 0;
+                                for (int a = 0; a < 3; ++a) {
+                                    const int dim_a = config.axes_dim[(size_t) a];
+                                    for (int k = 0; k < dim_a / 2; ++k) {
+                                        const int kk = off + k;
+                                        ff[(size_t) kk] = powf(10000.0f,
+                                                              2.0f * (float) k / (float) dim_a -
+                                                              2.0f * (float) kk / (float) config.head_dim);
+                                    }
+                                    off += dim_a / 2;
+                                }
+                                // ggml 要求 positions 是 1D：长度 4*n_tok，4 个轴各占一段（见 htp/rope-ops.c）
+                                rope_pos_holder = sd::Tensor<int32_t>({4 * n_tok}, std::move(pos));
+                                rope_ff_holder  = sd::Tensor<float>({n_pair}, std::move(ff));
+                                ctx.rope_positions    = make_input(rope_pos_holder);
+                                ctx.rope_freq_factors = make_input(rope_ff_holder);
+                                for (int a = 0; a < 3; ++a) {
+                                    ctx.rope_sections[a] = config.axes_dim[(size_t) a] / 2;
+                                }
+                            }
+                        }
+                    }
                     auto out = model.forward(&ctx, make_input(x), make_input(*ts_ptr), cached ? nullptr : make_input(context),
                                              ref_inputs, pe, layout, masks, checked_cache, joint_t);
                     if (!flash_attn_used) {
