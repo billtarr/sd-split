@@ -1508,3 +1508,81 @@ manifest 新增字段 `requires.minAvailableMb`（与 `ramMb` 区分：`ramMb` �
 
 - **App 重启后部署列表为空**：`am force-stop` 后要重新点「部署」。服务列表没有持久化，属于体验问题。
 - 512² 的 VAE 仍是大头（~79 s），与本次无关。
+
+---
+
+## 27. 分辨率：预设 + 自定义，以及那次 `ggml_can_repeat` 崩溃的排查（2026-11-12）
+
+### 27.1 崩溃现场
+
+WebUI 里点生成，后端 SIGABRT（`进程退出 code=134`）：
+
+```
+ggml.c:2306: GGML_ASSERT(ggml_can_repeat(b, a)) failed
+[E] qwen_image_2_1: split worker recv latent failed (step 2)
+```
+
+调用点是 DiT 的 `modulate()`：
+
+```cpp
+auto rows  = ggml_ext_chunk(runner_ctx, params, 2, 1);   // 沿 batch 维切成 image / text 两组
+auto apply = [&](ggml_tensor* part, ggml_tensor* row) {
+    return ggml_mul(ctx, part, row);                      // ← can_repeat(b=row, a=part) 断言
+};
+```
+
+要点：`modulation.1` 是 `Linear(hidden, 4*hidden)`，forward 里先 `chunk(mod, 4, 0)` 再在
+`modulate` 里 `chunk(params, 2, 1)` —— **第二刀切的是 dim=1（batch 维）**，所以
+`params->ne[1]` 必须是 2。而 `ggml_ext_chunk` 自身有 `GGML_ASSERT(x->ne[dim] % num == 0)`，
+日志里没有触到那一行，说明崩的确实是后面的 `ggml_mul`，即某条分支下 `row` 与 `part`
+的某一维不整除。
+
+### 27.2 复现尝试：没复现
+
+同一进程内连发 5 个请求，含两次分辨率切换：
+
+| # | prompt | 尺寸 | 结果 |
+|---|---|---|---|
+| 1 | a cat | 320² | 200 / 76.6 s |
+| 2 | a lighthouse at sunset | 320² | 200 / 63.7 s |
+| 3 | a dog | **256²** | 200 / 43.0 s |
+| 4 | a red apple on a table | **448²** | 200 / 140.0 s |
+| 5 | a lighthouse on a cliff at sunset | **512²** | 200 / 240.4 s |
+
+五张图内容都正确（512² 也没出现之前担心的 FA 数值漂移）。**崩溃不可稳定复现**，
+所以没有改逻辑 —— 盲改调制那两行只会把「崩溃」变成「静默算错图」，更糟。
+
+### 27.3 埋了只在即将崩溃时触发的诊断
+
+`modulate` 的 `apply` 里加了：
+
+```cpp
+if (!ggml_can_repeat(row, part)) {
+    LOG_ERROR("qwen_image_2_1 modulate shape mismatch: row ne=[...] part ne=[...] prefix_length=%lld gate=%d", ...);
+}
+```
+
+正常跑零开销、零噪声；一旦再崩，日志会直接给出是哪一维不整除（`part->ne[0] % row->ne[0]`
+还是 `part->ne[1] % row->ne[1]`），届时能精确定位而不是猜。
+
+### 27.4 分辨率 UI：预设 + 自由输入
+
+- manifest：`size` 的 options 从 `['256','320','384']` 改为 **`['320','512']`**，默认 `320`。
+- 卡片上渲染成 `[320²] [512²] [自定义]`：数字档位用 `²` 写法，一行放得下。
+- 点「自定义」才弹输入框（`SizeInputDialog`），输入框校验 **16 的倍数、64~1024**：
+  VAE 下采样 8×、DiT patch 2×，不是 16 的倍数会让 latent 切不整。
+- 选中的自定义值直接变成 chip 标签（如 `448²`）并保持高亮，不会丢失。
+- 改完都提示「重启服务后生效」——`-W/-H` 只在启动时进命令行。
+
+### 27.5 512² 的实测代价
+
+**240.4 s**（8 步，v73）。比 320² 的 63.7 s 慢 3.8 倍，主要是 VAE 解码（~79 s）与
+attention 的二次项。数值这次是干净的，但 `SD_FLASH_ATTN_MAX_KV=0` 下 HMX 仍属「可能漂」，
+出图前建议先用 20 步确认一次。
+
+### 27.6 遗留
+
+- **分辨率有两处设置会打架**：卡片上的「分辨率」决定进程启动的 `-W/-H`；WebUI 页面里的
+  「尺寸」下拉是请求级参数。两者不一致时以请求为准，用户容易困惑，后续应让 WebUI 读
+  `/health` 里的 `sizes` 并默认跟随卡片。
+- 崩溃根因未定位（诊断已就位，等下次复现）。

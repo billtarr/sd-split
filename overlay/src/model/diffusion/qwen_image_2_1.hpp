@@ -421,6 +421,15 @@ namespace Qwen {
             auto apply = [&](ggml_tensor* part, ggml_tensor* row) {
                 row = gate ? ggml_tanh(ctx, row) : ggml_scale_bias(ctx, row, 1.f, 1.f);
                 runner_ctx->expand_graph(row);
+                // 只在「即将崩」时打一行：正常运行时零开销、零噪声。
+                // 崩的是 ggml_mul 的 GGML_ASSERT(ggml_can_repeat(b, a))，靠这行能看清是哪一维不整除。
+                if (!ggml_can_repeat(row, part)) {
+                    LOG_ERROR("qwen_image_2_1 modulate shape mismatch: row ne=[%lld,%lld,%lld,%lld] "
+                              "part ne=[%lld,%lld,%lld,%lld] prefix_length=%lld gate=%d",
+                              (long long) row->ne[0], (long long) row->ne[1], (long long) row->ne[2], (long long) row->ne[3],
+                              (long long) part->ne[0], (long long) part->ne[1], (long long) part->ne[2], (long long) part->ne[3],
+                              (long long) prefix_length, gate ? 1 : 0);
+                }
                 return ggml_mul(ctx, part, row);
             };
             if (prefix_length == 0) {
