@@ -55,6 +55,11 @@ CONV_DIRECT="${CONV_DIRECT:-auto,vae=on}"
 # （SD_FLASH_ATTN_MAX_KV，默认 1024）：256²(265 token) 走 FA，512²(4105) 自动退回 f32 三段式。
 # 完全关掉：FLASH_ATTN=off
 FLASH_ATTN="${FLASH_ATTN-off,diffusion=on}"
+# VAE 分块解码。★ 512² 的最后一档 conv（512×512 输出）kparams 求解失败，整档落 CPU →
+# VAE 解码 78.5 s；切成 320 的 tile 后每一档都能上 HTP：512² 78.5 → 6.8 s。
+# 320² 只多 0.23 s（1.93 → 2.16，单 tile 走同一路径），所以默认全尺寸开。
+# 关掉：VAE_TILING=
+VAE_TILING="${VAE_TILING---vae-tiling --vae-tile-size 320}"
 
 [ -n "$SD_DIT_DUMP_DIR" ] && mkdir -p "$SD_DIT_DUMP_DIR"
 
@@ -67,6 +72,7 @@ FLASH_ATTN="${FLASH_ATTN-off,diffusion=on}"
   --backend "diffusion=HTP0,vae=$VAE_BACKEND,te=CPU" \
   ${CONV_DIRECT:+--conv-direct "$CONV_DIRECT"} \
   ${FLASH_ATTN:+--flash-attn "$FLASH_ATTN"} \
+  ${VAE_TILING:+$VAE_TILING} \
   -o "out_$TAG.png"
 
 echo "CHAIN exit=$?"
