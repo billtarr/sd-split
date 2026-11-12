@@ -1627,3 +1627,58 @@ uncond 分支，把 cond/uncond 拼成 **batch=2** 一起跑；而分段链的 t
   「尺寸」下拉是请求级参数。两者不一致时以请求为准，用户容易困惑，后续应让 WebUI 读
   `/health` 里的 `sizes` 并默认跟随卡片。
 - ~~崩溃根因未定位~~ → 已定位（§27.6），诊断代码保留：以后再出现 `!ggml_can_repeat` 会直接打印 shape。
+
+---
+
+## 28. WebUI：加种子、锁步数（2026-11-12）
+
+### 28.1 步数锁死 8
+
+Turbo 的步数与 sigmas、权重是配套训出来的，改步数只会出糊图或半成品，所以**从三处一起锁死**：
+
+| 位置 | 改动 |
+|---|---|
+| `manifest.params` | 删掉 `steps`（1~20 可调）——App 的参数对话框里不再出现它 |
+| `manifest.entry.args` / `env` | `--steps {steps}` → `--steps 8`；`SD_DIT_SPLIT_STEPS: "{steps}"` → `"8"` |
+| `assets/webui/index.html` | 原来的 `<select>`（4/8/12/20）换成只读 `<span class="pill">8 · 锁定</span>` |
+
+★ 为什么不「删参数但不改 args」：`ArgsBuilder.build()` 对未解析的占位符会替换成**空串**，
+`--steps ""` 会直接把后端参数解析打崩。删参数必须同时把占位符改成字面量。
+
+`/health` 也因此不再下发 `steps`（它读的是实例 params 表），WebUI 侧保留默认 `lockSteps=8`，
+如果哪天包里的步数不是 8，health 一旦下发就会覆盖 pill 文本 —— 显示的永远是实际在用的那个数。
+
+### 28.2 种子
+
+- 新增 `种子` 输入框（默认 `-1`）+ `随机` 按钮：`-1` 每次随机，填 0~4294967295 的整数则复现。
+- 前端校验：非整数或越界直接拦（后端 `resolve_seed` 只认 `>=0`，越界值会被静默处理，不如前端说清楚）。
+- **随机时把实际种子回填到输入框**——否则随机出来的图永远无法复现。
+- 状态行后缀 `· seed 1027286664`，输入框右侧另显示「本次种子 …」。
+
+### 28.3 ★ 坑：`info` 是 JSON **字符串**，不是对象
+
+第一版写成 `j.info && typeof j.info === 'object'`，结果跑完状态行没有 seed、输入框也没回填。
+原因在 `examples/server/routes_sdapi.cpp:661`：
+
+```cpp
+out["info"] = jsoninfo.dump();     // ← dump() 出的是 string
+```
+
+这是 A1111 的历史惯例。改成先 `JSON.parse`：
+
+```js
+let info = j.info;
+if (typeof info === 'string') { try { info = JSON.parse(info); } catch (e) { info = null; } }
+if (info && typeof info === 'object' && Number.isFinite(Number(info.seed))) used = Number(info.seed);
+```
+
+（后端 `prepare_info_field()` 返回的确实是 json 对象，坑在最后一步 `dump()`。）
+
+### 28.4 实测（v73，320²/8 步）
+
+| 项 | 结果 |
+|---|---|
+| WebUI 点生成（seed=-1） | **79.5 s**，状态 `完成 · 79.5 s（8 步 320² · seed 1027286664）`，种子框自动回填 |
+| 同 seed 连发两次（curl 直连网关） | 59.5 s / 59.8 s，**md5 完全相同** `8a22d90b0dd192721cedd52e3dc6e682` |
+| `/health` | `cfg_scale: 1.0, size: 320`，不再有 `steps` |
+| 步数 | 命令行为字面 `--steps 8`，页面上无任何入口可改 |
