@@ -39,6 +39,12 @@ mf_test.json
 mf_now.json
 t[0-9].json
 t[0-9].png
+v[0-9].png
+w[0-9].png
+s[0-9].json
+s[0-9].png
+cfg[0-9].json
+g[ab].json
 /dist/
 qs-split-ctx.bin
 
