@@ -7,29 +7,31 @@
 v73 每个 fastrpc PD 只有 **2304 MB** 的 IOVA 窗口，装不下 3.91 GiB 的 DiT，
 所以按层切成 3 段（11 / 11 / 10 层），每段 ≈ 1.45 GB，一次 map 到底、全程常驻。
 
-## 实测（256² / 8 步 / seed 42，一加 Ace 2 Pro）
+## 实测（一加 Ace 2 Pro，8 步 / seed 42，DiT+TE+VAE 全走 NPU）
 
-| 形态 | 采样 | VAE 解码 | 端到端 | 出图 |
-|---|---|---|---|---|
-| CPU 单进程 | 48.5 s/it | 58 s（CPU） | 437 s | 基线 |
-| NPU 单进程 + 权重流式（已移除） | 7.73 s/it | 58 s（CPU） | 133.8 s | `39595a07…` |
-| NPU 三段 + VAE 上 NPU | 5.05 s/it | 19.2 s | 85.1 s | `1ceb0cc0…` |
-| 上面再加 TE 用完即释放 | 5.10 s/it | 17.8 s | 91.7~96.6 s | `1ceb0cc0…` |
-| 当前默认（+ 原生 M-RoPE + VAE conv-direct + flash attn 全解锁） | **1.45 s/it** | **1.55 s** | **~37~63 s** | MAE 1.4/255 vs 上表 |
+| 分辨率 | DiT 采样 | VAE 解码 | 端到端 |
+|---|---|---|---|
+| 256² | 1.46 s/it | 1.61 s | **52.6 s**（一次性 chain）/ 45.7 s（常驻服务，第二请求起） |
+| 320² | 2.18 s/it | 2.35 s | **41.8 s** |
+| 512² | 5.32 s/it | 7.82 s | **~60 s**（App 常驻 56.9 s；一次性 chain 71.3 s） |
+
+> 对照：修 VAE tiling 之前 512² 端到端 171~261 s；rope 修复前 DiT 17.5 s/it。
 
 - 三段相对整模型：采样 **−34%**。全程 `mapped 1450 MiB` 常驻、**权重零搬运**——每段一次 map 到底，
   不做任何换入换出（流式代码已整体移除，见「已知限制」）。
 - **原生 M-RoPE**（`SD_ROPE_NATIVE`，默认开）：替掉「转置 + repeat + mul」的退化分解
   （内层维只有 2，HVX 无法向量化），采样 **5.07 → 1.92 s/it**。与旧路径 MAE 0.45/255。
-- **VAE conv-direct**（`CONV_DIRECT=auto,vae=on`，默认开）：sd.cpp 的 auto 探测要求后端有
-  implicit GEMM，HTP0 一律判 off → 卷积退化成 im2col（256² 产物 324 MB）被尺寸门槛拒掉、
-  整段回退 CPU，图被切成 31 段交替。强制走 HTP 原生 `CONV_2D` 后解码 **17.43 → 1.55 s**。
+- **VAE conv-direct + tiling**（`--conv-direct auto,vae=on --vae-tiling --vae-tile-size 320`，默认开）：
+  sd.cpp 的 auto 探测要求后端有 implicit GEMM，HTP0 一律判 off → 卷积退化成 im2col 整段回退 CPU；
+  强制走 HTP 原生 `CONV_2D` 后 256² 解码 17.43 → 1.55 s。512² 最后一档 conv 上不了 HTP（VTCM 约束），
+  靠 tiling 把 512² 解码从 ~99 s 压到 **7.8 s**（见 `docs/npu-split.md §19`）。
 - **flash attention**（`FLASH_ATTN=off,diffusion=on`，默认开）：`FLASH_ATTN_EXT` 替掉
-  f32 的 QK^T + SOFT_MAX + PV（QK^T 块原本只有 35 GFLOPS），采样 **1.92 → 1.45 s/it**。
+  f32 的 QK^T + SOFT_MAX + PV（QK^T 块原本只有 35 GFLOPS），256² 采样 **1.92 → 1.46 s/it**。
   sd.cpp 的 auto 探测在 HTP 上是假阴性（`insufficient probe memory`，见「已知限制」）。
 - TE 用完即释放：末段 RSS **4.48 GB → 24 MB**，代价 +7~13% 时间。
-- 512² / 8 步（默认参数）：**253~260 s**（采样 8×17.8~19.0 s、VAE 80 s；此前 437.7~492.8 s）。
-  采样在这里**没有**走 flash attention：HMX 内核对 4105 个 key 的数值会漂（详见「已知限制」）。
+- 算力口径（逐张量核实，Q4_K_M 不改变 MAC 次数）：DiT **10.3/11.0/12.5 TFLOPS**（256²/320²/512²，
+  随 token 数次线性）、VAE 16/19/13.2、整链纯计算 **11.1/12.0/12.7 TFLOPS**（详见
+  `docs/npu-split.md §29`）。
 
 数值判据：分段结果与整模型**逐位相同**（`vel` 8/8 步 `max|d| = 0`，出图 md5 一致）。
 两条新增快路的判据用 MAE/PSNR（换 kernel 后浮点尾数会变，md5 不再逐位一致）。
@@ -110,7 +112,7 @@ ref/                libggml-htp-v73.so（DSP applet）、libcdsprpc.so（ABI 常
 - **权重流式已彻底移除**（`relinquish/restore`、`MAPBUDGET`、`RPCMEM_FREE` 全部删除）。
   它能把 3.9 GiB 塞进 2304 MB 窗口，但 256² 每步要搬 6.9 GB、8 步共 54.9 GiB；分段之后完全不需要。
   代价：**单进程跑整模型这条路没有了**——权重 > 2304 MB 会直接 map 失败，必须走分段。
-- ~~512² 的 VAE 152 s~~ → 已解决（conv-direct，152 → 80 s，见 `docs/npu-split.md §19`）。
+- ~~512² 的 VAE 152 s~~ → 已解决（conv-direct + tiling，152 → 99 → **7.8 s**，见 `docs/npu-split.md §19`）。
 - **flash attention 的 auto 探测在 HTP 上是假阴性**：`flash attention auto: HTP0 -> off
   (insufficient probe memory)`。`sd_run_backend_probe()` 用 `ggml_backend_dev_memory()` 做前置
   检查，而 HTP 的 `get_memory()` 只回 `opt_mbuf_total`（`GGML_HEXAGON_MBUF` 之和），与真正的
@@ -120,11 +122,8 @@ ref/                libggml-htp-v73.so（DSP applet）、libcdsprpc.so（ABI 常
   参考只有 4.2。所以 `ggml_extend.cpp` 里按 token 数设了门槛（`SD_FLASH_ATTN_MAX_KV`，默认
   1024）：256² 走 FA，512² 自动退回 f32 三段式。**1024 是启发值，只在 265/4105 两个点验证过。**
   HVX 路径虽然准，但 512² 要 21.85 s/it，比不开 FA 的 17.80 还慢。
-- **常驻分段服务（`tools/serve.sh`）当前不可用**：`sd-server` 不能当分段 worker —— spawn 是
-  `execv("/proc/self/exe", 原 argv)`，sd-cli 的 main 会立刻开始生成（于是进入握手），
-  而 sd-server 的 main 去起 HTTP 监听，永远走不到 `compute()`，父进程在 socket 上死等。
-  另外 `image.cpp` 的 `SD_DIT_RELEASE_TE` 判据只看变量存在不看值，服务模式下 TE 照样被释放。
-  现在能用的形态是 `python tools/webui.py` + chain 模式（256² 57.6 s 往返、512² 158.3 s）。
+- **常驻分段服务已打通**（`tools/serve.sh`，`sd-server` 当末段 + 两个常驻 worker）：首次请求 87.8 s、
+  第二请求起 256² 45.7 s、512² 56.9 s，换分辨率不用重启。一次性跑用 `python tools/webui.py` + chain 模式。
   详见 `docs/npu-split.md §22`。
 - **rope 的两次 `CONT` 约占 DSP 10%**（去交织/还原，各 ~2 ms / 4.3 MB）。原生内核只支持
   半切配对（MROPE），而去交织在 ggml 里只能靠 `cont(permute)`，删不掉。
@@ -137,5 +136,5 @@ ref/                libggml-htp-v73.so（DSP applet）、libcdsprpc.so（ABI 常
 
 ## 相关
 
-姊妹项目 [llamasplit](../llamasplit)：llama.cpp 的按层切分，同样的 IOVA 窗口约束，
-那边每段 1.15~1.5 GB。
+姊妹项目 [llama-split](https://github.com/billtarr/llama-split)：llama.cpp 的按层切分，
+同样的 IOVA 窗口约束，那边每段 1.15~1.5 GB。
