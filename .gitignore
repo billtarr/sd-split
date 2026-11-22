@@ -53,3 +53,6 @@ __pycache__/
 *.pyc
 *~
 .*.un~
+
+# 探针编译产物
+tools/sess_probe

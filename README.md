@@ -13,7 +13,7 @@ v73 每个 fastrpc PD 只有 **2304 MB** 的 IOVA 窗口，装不下 3.91 GiB �
 |---|---|---|---|
 | 256² | 1.46 s/it | 1.61 s | **52.6 s**（一次性 chain）/ 45.7 s（常驻服务，第二请求起） |
 | 320² | 2.18 s/it | 2.35 s | **41.8 s** |
-| 512² | 5.32 s/it | 7.82 s | **~60 s**（App 常驻 56.9 s；一次性 chain 71.3 s） |
+| 512² | 5.32 s/it | 7.82 s | **57 s**（App 常驻 56.9 s；一次性 chain 71.3 s） |
 
 > 对照：修 VAE tiling 之前 512² 端到端 171~261 s；rope 修复前 DiT 17.5 s/it。
 
@@ -29,9 +29,15 @@ v73 每个 fastrpc PD 只有 **2304 MB** 的 IOVA 窗口，装不下 3.91 GiB �
   f32 的 QK^T + SOFT_MAX + PV（QK^T 块原本只有 35 GFLOPS），256² 采样 **1.92 → 1.46 s/it**。
   sd.cpp 的 auto 探测在 HTP 上是假阴性（`insufficient probe memory`，见「已知限制」）。
 - TE 用完即释放：末段 RSS **4.48 GB → 24 MB**，代价 +7~13% 时间。
-- 算力口径（逐张量核实，Q4_K_M 不改变 MAC 次数）：DiT **10.3/11.0/12.5 TFLOPS**（256²/320²/512²，
-  随 token 数次线性）、VAE 16/19/13.2、整链纯计算 **11.1/12.0/12.7 TFLOPS**（详见
-  `docs/npu-split.md §29`）。
+- **算力口径**（逐张量核实，Q4_K_M 不改变 MAC 次数）。token 数 =（边长 ÷ 16）² + 文本，
+  三档 = **265 / 410 / 1033**；每步 **3.75 / 5.83 / 15.02 TFLOP**，8 步 + VAE = **30.8 / 47.9 / 123.4 TFLOP**；
+  除以纯计算耗时（13.4 / 19.5 / 50.4 s）得 DiT **2.3 / 2.4 / 2.5 TFLOPS**，VAE 单列 0.81 / 1.26 / 3.22 TFLOP。
+  若用端到端 41.8 s / 56.9 s 去除，只剩 **1.1 / 2.2** —— 差的二十几秒是三进程拉起、TE 编码、首步建图，
+  那是固定开销，不是算力。**跨尺寸横比只看纯计算这一列**（详见 `docs/npu-split.md §29.7`）。
+
+  > 早期版本写的「11~12 TFLOPS」已作废：当时把 token 按 8× 下采样估成 1034/1610/4106，多算 4 倍。
+  > 真值来自 VAE —— **下采样 16×、latent 64 通道**，`img_in` 是 1×1 patch（`patchify(x,1,1)`），没有 patchify。
+  > 另：45 TOPS 是高通的 **INT8** 标称，**FP16 没有公开峰值**，所以不折算「利用率」。
 
 数值判据：分段结果与整模型**逐位相同**（`vel` 8/8 步 `max|d| = 0`，出图 md5 一致）。
 两条新增快路的判据用 MAE/PSNR（换 kernel 后浮点尾数会变，md5 不再逐位一致）。
@@ -91,7 +97,8 @@ overlay/            对上游的全部改动，按相对路径覆盖（build.sh 
   ggml/include/ggml.h、ggml/src/ggml.c     后端注册
   ggml/src/ggml-hexagon/                   从 llama.cpp 移植的 HTP 后端（含 sdk-shim）
 tools/              chain.sh（三段）/ serve.sh（分段常驻服务）/ webui.py / memwatch.sh / mempeak.sh
-docs/               架构、运行手册、移植踩坑与实测数据
+docs/               npu-split.md（主文档：现状 / 实测 / 算力口径）、
+                    npu-port.md（移植与踩坑）、runbook.md（运行手册）
 ref/                libggml-htp-v73.so（DSP applet）、libcdsprpc.so（ABI 常量参考）
 ```
 
@@ -108,7 +115,9 @@ ref/                libggml-htp-v73.so（DSP applet）、libcdsprpc.so（ABI 常
 
 ## 已知限制
 
-- **v73 单 CDSP 核**：两进程同时算会算力对折，多进程只扩容不加速。
+- **v73 单 CDSP 核**：同一条链的三个进程是**串行流水**，不是并行 —— 切开本身不加速，只是让 4 GB 权重放得下。
+  跨请求并发也只是把同一个核做时间切片：8 路时每路 `tg` 从 14.5 掉到 5~6.5 t/s，聚合约 48 t/s。
+  所以延迟型场景 1 路最好，聚合吞吐型 4~8 路有意义。
 - **权重流式已彻底移除**（`relinquish/restore`、`MAPBUDGET`、`RPCMEM_FREE` 全部删除）。
   它能把 3.9 GiB 塞进 2304 MB 窗口，但 256² 每步要搬 6.9 GB、8 步共 54.9 GiB；分段之后完全不需要。
   代价：**单进程跑整模型这条路没有了**——权重 > 2304 MB 会直接 map 失败，必须走分段。
