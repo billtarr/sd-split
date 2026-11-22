@@ -152,7 +152,8 @@ def main():
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--flops", action="store_true",
                     help="按张量形状算每步 FLOPs 与有效算力（默认 Qwen-Image 三档）")
-    ap.add_argument("--tokens", default="1034,1610,4106", help="图像 token 数，逗号分隔")
+    ap.add_argument("--tokens", default="265,410,1033",
+                    help="图像 token 数（=(边长/16)^2+文本：256²=265 / 320²=410 / 512²=1033），逗号分隔")
     ap.add_argument("--s-it", dest="s_it", default="1.46,2.18,5.32", help="对应实测 s/it")
     a = ap.parse_args()
 
